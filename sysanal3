@@ -498,33 +498,6 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 8. Multi-node: SSH into worker nodes
-# ---------------------------------------------------------------------------
-if [[ $IS_LEADER -eq 1 && $TOTAL_NODES -gt 1 && $IS_WORKER -eq 0 ]]; then
-    header "Multi-node: Analyzing worker nodes"
-    SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0")
-
-    for node_num in $(seq 2 "$TOTAL_NODES"); do
-        worker_ip=$(redis-cli --raw hget "node/${node_num}/vpn" ip_address 2>/dev/null || true)
-        if [[ -z "$worker_ip" ]]; then
-            # Try extracting from endpoint
-            worker_ip=$(redis-cli --raw hget "node/${node_num}/vpn" endpoint 2>/dev/null | cut -d: -f1 || true)
-        fi
-        if [[ -z "$worker_ip" ]]; then
-            warning "Cannot determine IP for worker node ${node_num}, skipping"
-            continue
-        fi
-
-        echo ""
-        echo -e "${BOLD}>>>>>>>>>>> Worker Node ${node_num} (${worker_ip}) <<<<<<<<<<<${NC}"
-        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "root@${worker_ip}" "bash -s -- --worker" < "$SCRIPT_PATH" 2>&1 || {
-            warning "Failed to SSH into worker node ${node_num} (${worker_ip})"
-        }
-        echo -e "${BOLD}>>>>>>>>>>> End Worker Node ${node_num} <<<<<<<<<<<${NC}"
-    done
-fi
-
-# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
