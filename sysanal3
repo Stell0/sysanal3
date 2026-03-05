@@ -1,0 +1,541 @@
+#!/bin/bash
+#
+# sysanal3 - NethServer 8 System Analyzer
+# Analyzes a NethServer 8 system and searches for known issues automatically.
+#
+# Usage: curl URL | bash
+#
+
+set -o pipefail
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+PROBLEMS=0
+WARNINGS=0
+declare -a PROBLEM_MSGS=()
+declare -a WARNING_MSGS=()
+
+problem() { echo -e "${RED}[PROBLEM]${NC} $*"; PROBLEM_MSGS+=("$*"); ((PROBLEMS++)); }
+warning() { echo -e "${YELLOW}[WARNING]${NC} $*"; WARNING_MSGS+=("$*"); ((WARNINGS++)); }
+info()    { echo -e "${CYAN}[INFO]${NC} $*"; }
+ok()      { echo -e "${GREEN}[OK]${NC} $*"; }
+header()  { echo ""; echo -e "${BOLD}=== $* ===${NC}"; }
+
+# ---------------------------------------------------------------------------
+# Configurable constants
+# ---------------------------------------------------------------------------
+RESTART_THRESHOLD=5            # Container restarts above this count flag a problem
+DNS_SLOW_MS=2000               # DNS resolution slower than this (ms) flags a problem
+INTERNET_OK=1                  # Set to 0 if connectivity precheck fails
+IS_WORKER=0                    # Set to 1 when running via SSH on a worker node
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --worker) IS_WORKER=1; shift ;;
+        *)        shift ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# Pre-flight
+# ---------------------------------------------------------------------------
+if [[ $EUID -ne 0 ]]; then
+    echo "This script must be run as root"
+    exit 1
+fi
+
+echo -e "${BOLD}sysanal3 - NethServer 8 System Analyzer${NC}"
+echo "========================================="
+echo "Date: $(date)"
+
+# ---------------------------------------------------------------------------
+# Internet connectivity precheck
+# ---------------------------------------------------------------------------
+header "Pre-check: Internet connectivity"
+
+if ping -qc 1 -W 3 sos.nethesis.it &>/dev/null; then
+    ok "Internet connectivity OK (sos.nethesis.it reachable)"
+else
+    warning "No internet connectivity (sos.nethesis.it unreachable) — GitHub version checks will be skipped"
+    INTERNET_OK=0
+fi
+
+# ---------------------------------------------------------------------------
+# General System Data
+# ---------------------------------------------------------------------------
+header "General System Data"
+
+# IP addresses
+info "IP addresses: $(hostname -I 2>/dev/null | xargs || echo 'N/A')"
+
+# DNS nameservers
+_nameservers=$(grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | xargs || true)
+info "DNS nameservers: ${_nameservers:-N/A}"
+
+# Hostname / FQDN
+info "Hostname: $(hostname -f 2>/dev/null || hostname 2>/dev/null || echo 'N/A')"
+
+# Open file descriptors
+_filenr=$(cat /proc/sys/fs/file-nr 2>/dev/null || true)
+if [[ -n "$_filenr" ]]; then
+    _used=$(echo "$_filenr" | awk '{print $1}')
+    _max=$(echo "$_filenr" | awk '{print $3}')
+    info "Open file descriptors: ${_used} / ${_max}"
+    if [[ "$_max" -gt 0 ]] && (( _used * 100 / _max >= 90 )); then
+        problem "Open file descriptors at ${_used}/${_max} (>= 90%)"
+    fi
+fi
+
+# Root filesystem usage
+_rootfs=$(df -h / 2>/dev/null | awk 'NR==2{printf "%s used / %s total (%s full)", $3, $2, $5}')
+info "Root filesystem: ${_rootfs:-N/A}"
+_root_pct=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}')
+if [[ -n "$_root_pct" && "$_root_pct" -ge 90 ]]; then
+    problem "Root filesystem usage at ${_root_pct}% (>= 90%)"
+fi
+
+# Uptime
+info "Uptime: $(uptime -p 2>/dev/null || uptime | sed 's/.*up/up/' || echo 'N/A')"
+
+# Timezone
+_tz=$(timedatectl 2>/dev/null | grep -i 'time zone' | awk '{print $3, $4, $5}' || true)
+info "Timezone: ${_tz:-N/A}"
+
+# Cluster subscription system_id
+_sub_id=$(redis-cli --raw hget cluster/subscription system_id 2>/dev/null || true)
+if [[ -z "$_sub_id" ]]; then
+    warning "Cluster subscription system_id is empty or missing"
+else
+    info "Subscription system_id: ${_sub_id}"
+fi
+
+# Cluster UUID
+_cluster_uuid=$(redis-cli --raw get cluster/uuid 2>/dev/null || true)
+info "Cluster UUID: ${_cluster_uuid:-N/A}"
+
+# ---------------------------------------------------------------------------
+# 1. Check for sngrep running > 1 day
+# ---------------------------------------------------------------------------
+header "Check: sngrep long-running instances"
+
+sngrep_pids=$(pgrep -x sngrep 2>/dev/null || true)
+if [[ -n "$sngrep_pids" ]]; then
+    while read -r pid; do
+        elapsed=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
+        if [[ -n "$elapsed" && "$elapsed" -gt 86400 ]]; then
+            elapsed_days=$((elapsed / 86400))
+            problem "sngrep (PID $pid) running for ${elapsed_days} day(s)"
+        else
+            info "sngrep (PID $pid) running for less than 1 day"
+        fi
+    done <<< "$sngrep_pids"
+else
+    ok "No sngrep instances found"
+fi
+
+# ---------------------------------------------------------------------------
+# 2. List all modules on this node
+# ---------------------------------------------------------------------------
+header "Check: List all modules on this node"
+
+# NODE_ID is stored in /var/lib/nethserver/node/state/environment
+NODE_ID=$(grep -oP '^NODE_ID=\K.*' /var/lib/nethserver/node/state/environment 2>/dev/null || true)
+if [[ -z "$NODE_ID" ]]; then
+    # Fallback: extract from AGENT_ID in agent.env (e.g. "node/1" -> "1")
+    NODE_ID=$(grep -oP '^AGENT_ID=node/\K\d+' /var/lib/nethserver/node/state/agent.env 2>/dev/null || true)
+fi
+if [[ -z "$NODE_ID" ]]; then
+    problem "Cannot determine node ID (checked /var/lib/nethserver/node/state/environment and agent.env)"
+    NODE_ID="1"
+fi
+
+# Leader-node detection and multi-node info
+LEADER_VPN_IP=$(redis-cli --raw hget node/1/vpn endpoint 2>/dev/null | cut -d: -f1 || true)
+TOTAL_NODES=$(redis-cli --raw KEYS 'node/*/vpn' 2>/dev/null | wc -l || echo 1)
+IS_LEADER=0
+if [[ "$NODE_ID" == "1" ]]; then
+    IS_LEADER=1
+fi
+info "Node ${NODE_ID} of ${TOTAL_NODES} total node(s) (leader: $(if [[ $IS_LEADER -eq 1 ]]; then echo 'yes'; else echo 'no'; fi))"
+if [[ $IS_LEADER -eq 1 && $TOTAL_NODES -gt 1 ]]; then
+    info "Worker nodes will be analyzed after local checks"
+fi
+
+# Fetch all installed modules via api-cli (JSON output)
+MODULES_JSON=$(api-cli run list-installed-modules 2>/dev/null || true)
+
+if [[ -z "$MODULES_JSON" ]] || ! echo "$MODULES_JSON" | jq empty 2>/dev/null; then
+    warning "Cannot retrieve installed modules (api-cli failed)"
+    MODULES_JSON="{}"
+fi
+
+# Extract modules on this node: id, source (image URL), version, module (base name)
+# Each line: id|source|version|module
+MODULES_ON_NODE=$(echo "$MODULES_JSON" | jq -r --arg nid "$NODE_ID" '
+    [.[][] | select(.node == $nid)] | sort_by(.id)[] |
+    "\(.id)|\(.source)|\(.version)|\(.module)"
+' 2>/dev/null || true)
+
+# Plain list of module IDs for later checks
+MODULES=$(echo "$MODULES_ON_NODE" | cut -d'|' -f1 | grep -v '^$' || true)
+
+if [[ -z "$MODULES" ]]; then
+    warning "No modules found on node ${NODE_ID}"
+else
+    info "Modules on node ${NODE_ID}:"
+    while IFS='|' read -r mod_id mod_source mod_version mod_name; do
+        echo "  - ${mod_id} (${mod_name}) version ${mod_version}"
+    done <<< "$MODULES_ON_NODE"
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Module version vs latest GitHub release
+# ---------------------------------------------------------------------------
+header "Check: Module version vs latest GitHub release"
+
+if [[ $INTERNET_OK -eq 0 ]]; then
+    warning "Skipping GitHub version checks (no internet connectivity)"
+else
+
+check_module_version() {
+    local mod_id="$1"
+    local mod_source="$2"
+    local mod_version="$3"
+    local mod_name="$4"
+
+    if [[ -z "$mod_source" || -z "$mod_version" ]]; then
+        warning "${mod_id}: missing source or version info"
+        return
+    fi
+
+    # Derive GitHub repo from source image URL
+    # e.g. ghcr.io/nethserver/traefik -> nethserver/ns8-traefik
+    # e.g. ghcr.io/nethesis/nethvoice -> nethesis/ns8-nethvoice
+    local image_path="${mod_source#*/}"    # drop registry host (ghcr.io/)
+    local org="${image_path%%/*}"          # e.g. "nethserver" or "nethesis"
+    local github_repo="${org}/ns8-${mod_name}"
+
+    local latest_tag
+    latest_tag=$(curl -sf --max-time 10 \
+        "https://api.github.com/repos/${github_repo}/releases/latest" \
+        | grep -oP '"tag_name"\s*:\s*"\K[^"]+' || true)
+
+    if [[ -z "$latest_tag" ]]; then
+        info "${mod_id}: cannot fetch latest release for ${github_repo} (installed: ${mod_version})"
+        return
+    fi
+
+    if [[ "$mod_version" != "$latest_tag" ]]; then
+        warning "${mod_id}: installed ${mod_version}, latest is ${latest_tag} (repo: ${github_repo})"
+    else
+        ok "${mod_id}: up to date (${mod_version})"
+    fi
+}
+
+if [[ -n "$MODULES_ON_NODE" ]]; then
+    while IFS='|' read -r mod_id mod_source mod_version mod_name; do
+        check_module_version "$mod_id" "$mod_source" "$mod_version" "$mod_name"
+    done <<< "$MODULES_ON_NODE"
+else
+    info "No modules to check"
+fi
+
+fi  # end INTERNET_OK check
+
+# ---------------------------------------------------------------------------
+# 3b. Per-module container health overview
+# ---------------------------------------------------------------------------
+header "Check: Container health per module"
+
+if [[ -n "$MODULES" ]]; then
+    while read -r mod; do
+        container_info=$(runagent -m "$mod" podman ps -a --format '{{.Names}} [Status:{{.Status}}] [Restarts:{{.Restarts}}]' 2>/dev/null || true)
+        if [[ -z "$container_info" ]]; then
+            continue
+        fi
+        info "Containers for ${mod}:"
+        while read -r cline; do
+            echo "  ${cline}"
+            # Flag unhealthy states
+            if echo "$cline" | grep -qiE '\[Status:(Created|Exited|Paused)'; then
+                warning "${mod}: container not running — ${cline%% \[*}"
+            fi
+            # Flag high restart counts
+            _restarts=$(echo "$cline" | grep -oP '\[Restarts:\K[0-9]+' || echo 0)
+            if [[ "$_restarts" -gt "$RESTART_THRESHOLD" ]]; then
+                problem "${mod}: container ${cline%% \[*} has ${_restarts} restarts (threshold: ${RESTART_THRESHOLD})"
+            fi
+        done <<< "$container_info"
+
+        # Show TRAEFIK_HOST if present
+        _traefik_host=$(cat ~"${mod}"/.config/state/environment 2>/dev/null | grep -oP '^TRAEFIK_HOST=\K.*' || true)
+        if [[ -n "$_traefik_host" ]]; then
+            info "${mod}: TRAEFIK_HOST=${_traefik_host}"
+        fi
+    done <<< "$MODULES"
+else
+    info "No modules to check"
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Failed systemd services
+# ---------------------------------------------------------------------------
+header "Check: Failed systemd services"
+
+# System-wide
+failed_system=$(systemctl --failed --no-legend --no-pager 2>/dev/null || true)
+if [[ -n "$failed_system" ]]; then
+    problem "Failed system services:"
+    while read -r line; do
+        echo "  ${line}"
+    done <<< "$failed_system"
+else
+    ok "No failed system services"
+fi
+
+# Per-module (user services — failed and dead)
+if [[ -n "$MODULES" ]]; then
+    while read -r mod; do
+        failed_user=$(runagent -m "$mod" systemctl --user --failed --no-legend --no-pager 2>/dev/null || true)
+        if [[ -n "$failed_user" ]]; then
+            problem "Failed services in module ${mod}:"
+            while read -r line; do
+                echo "  ${line}"
+            done <<< "$failed_user"
+        fi
+
+        # Also check for dead services (not failed but not running)
+        dead_services=$(runagent -m "$mod" systemctl --user list-units --type=service --no-legend --no-pager 2>/dev/null \
+            | awk '$3 == "inactive" || $4 == "dead" {print $1, $3, $4}' || true)
+        if [[ -n "$dead_services" ]]; then
+            warning "Dead/inactive services in module ${mod}:"
+            while read -r line; do
+                echo "  ${line}"
+            done <<< "$dead_services"
+        fi
+    done <<< "$MODULES"
+fi
+
+# ---------------------------------------------------------------------------
+# 5. NethVoice-specific checks
+# ---------------------------------------------------------------------------
+header "Check: NethVoice modules"
+
+# Match only "nethvoice" modules, not "nethvoice-proxy" or other nethvoice-* variants
+nethvoice_modules=$(echo "$MODULES_ON_NODE" | awk -F'|' '$4 == "nethvoice" {print $1}' || true)
+if [[ -n "$nethvoice_modules" ]]; then
+    while read -r nv_mod; do
+        info "Checking NethVoice module: ${nv_mod}"
+
+        # --- DNS resolution inside freepbx container ---
+        dns_start=$(date +%s%N)
+        dns_out=$(runagent -m "$nv_mod" podman exec freepbx getent hosts ibm.com 2>&1 || true)
+        dns_end=$(date +%s%N)
+        dns_ms=$(( (dns_end - dns_start) / 1000000 ))
+
+        if [[ -z "$dns_out" || "$dns_ms" -gt $DNS_SLOW_MS ]]; then
+            problem "${nv_mod}: DNS resolution failed or too slow (${dns_ms}ms, getent hosts ibm.com)"
+            info "${nv_mod}: /etc/resolv.conf inside container freepbx:"
+            runagent -m "$nv_mod" podman exec freepbx cat /etc/resolv.conf 2>/dev/null | while read -r line; do
+                echo "  ${line}"
+            done
+        else
+            ok "${nv_mod}: DNS OK (ibm.com resolved in ${dns_ms}ms)"
+        fi
+
+        # --- mysqlcheck ---
+        # Run mysqlcheck inside the mariadb container; root password is in $MARIADB_ROOT_PASSWORD
+        mysql_out=$(runagent -m "$nv_mod" podman exec mariadb \
+            sh -c 'mysqlcheck -uroot -p${MARIADB_ROOT_PASSWORD} -A' 2>&1 || true)
+
+        if echo "$mysql_out" | grep -qiE 'error|corrupt|crashed'; then
+            problem "${nv_mod}: mysqlcheck reported errors:"
+            echo "$mysql_out" | grep -iE 'error|corrupt|crashed' | while read -r line; do
+                echo "  ${line}"
+            done
+        elif [[ -z "$mysql_out" ]]; then
+            warning "${nv_mod}: mysqlcheck returned no output (mariadb container may not exist)"
+        else
+            ok "${nv_mod}: mysqlcheck OK"
+        fi
+
+        # --- Asterisk PJSIP contacts ---
+        pjsip_out=$(runagent -m "$nv_mod" podman exec freepbx asterisk -rx 'pjsip show contacts' 2>/dev/null || true)
+        if [[ -n "$pjsip_out" ]]; then
+            pjsip_count=$(echo "$pjsip_out" | grep -c '/sip:' || echo 0)
+            info "${nv_mod}: PJSIP registered contacts: ${pjsip_count}"
+            if [[ "$pjsip_count" -eq 0 ]]; then
+                # Check if asterisk is actually running
+                ast_running=$(runagent -m "$nv_mod" podman exec freepbx pgrep asterisk 2>/dev/null || true)
+                if [[ -n "$ast_running" ]]; then
+                    warning "${nv_mod}: Asterisk running but zero PJSIP contacts registered"
+                fi
+            fi
+        else
+            info "${nv_mod}: could not retrieve PJSIP contacts (Asterisk may not be running)"
+        fi
+    done <<< "$nethvoice_modules"
+else
+    info "No NethVoice modules found"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Listening Ports / Sockets
+# ---------------------------------------------------------------------------
+header "Check: Listening ports for installed services"
+
+check_port() {
+    local desc="$1" port="$2"
+    if ss -Hltn src :"${port}" 2>/dev/null | grep -q LISTEN; then
+        ok "${desc}: port ${port} is listening"
+    else
+        problem "${desc}: port ${port} is NOT listening"
+    fi
+}
+
+# Traefik (always expected on NS8)
+traefik_modules=$(echo "$MODULES" | grep -i "^traefik" || true)
+if [[ -n "$traefik_modules" ]]; then
+    check_port "Traefik HTTP" 80
+    check_port "Traefik HTTPS" 443
+fi
+
+# NethVoice SIP ports
+if [[ -n "$nethvoice_modules" ]]; then
+    check_port "NethVoice SIP (UDP/TCP)" 5060
+    check_port "NethVoice SIP-TLS" 5061
+fi
+
+# Samba / NethService AD
+samba_modules=$(echo "$MODULES" | grep -i "^samba" || true)
+if [[ -n "$samba_modules" ]]; then
+    check_port "Samba LDAP" 389
+    check_port "Samba LDAPS" 636
+fi
+
+# Mail
+mail_modules=$(echo "$MODULES" | grep -i "^mail" || true)
+if [[ -n "$mail_modules" ]]; then
+    check_port "Mail SMTP" 25
+    check_port "Mail IMAP" 143
+    check_port "Mail IMAPS" 993
+fi
+
+if [[ -z "$traefik_modules" && -z "$nethvoice_modules" && -z "$samba_modules" && -z "$mail_modules" ]]; then
+    info "No well-known services to check ports for"
+fi
+
+# ---------------------------------------------------------------------------
+# 7. CrowdSec – check if local IPs are blocked
+# ---------------------------------------------------------------------------
+header "Check: CrowdSec IP blocking"
+
+crowdsec_modules=$(echo "$MODULES" | grep -i "^crowdsec" || true)
+if [[ -n "$crowdsec_modules" ]]; then
+    cs_mod=$(echo "$crowdsec_modules" | head -1)
+    warning "CrowdSec module found: ${cs_mod} (may cause connectivity issues)"
+
+    # Find the CrowdSec container
+    cs_container=$(runagent -m "$cs_mod" podman ps --format '{{.Names}}' 2>/dev/null \
+        | grep -i crowdsec | head -1 || true)
+
+    if [[ -z "$cs_container" ]]; then
+        warning "CrowdSec container not found in module ${cs_mod}"
+    else
+        # Collect all local IPs (skip loopback)
+        local_ips=$(ip -o addr show 2>/dev/null \
+            | awk '{print $4}' | cut -d/ -f1 \
+            | grep -v '^127\.' | grep -v '^::1$' | sort -u)
+
+        blocked_found=0
+        if [[ -n "$local_ips" ]]; then
+            while read -r ip; do
+                result=$(runagent -m "$cs_mod" podman exec "$cs_container" \
+                    cscli decisions list -i "$ip" -o raw 2>/dev/null | tail -n +2 || true)
+                if [[ -n "$result" ]]; then
+                    problem "CrowdSec: local IP ${ip} is BLOCKED"
+                    echo "  ${result}"
+                    blocked_found=1
+                fi
+            done <<< "$local_ips"
+
+            if [[ "$blocked_found" -eq 0 ]]; then
+                ok "CrowdSec: no local IPs are blocked (checked $(echo "$local_ips" | wc -l) addresses)"
+            fi
+        else
+            warning "Could not determine local IP addresses"
+        fi
+    fi
+else
+    info "No CrowdSec module found, skipping"
+fi
+
+# ---------------------------------------------------------------------------
+# 8. Multi-node: SSH into worker nodes
+# ---------------------------------------------------------------------------
+if [[ $IS_LEADER -eq 1 && $TOTAL_NODES -gt 1 && $IS_WORKER -eq 0 ]]; then
+    header "Multi-node: Analyzing worker nodes"
+    SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0")
+
+    for node_num in $(seq 2 "$TOTAL_NODES"); do
+        worker_ip=$(redis-cli --raw hget "node/${node_num}/vpn" ip_address 2>/dev/null || true)
+        if [[ -z "$worker_ip" ]]; then
+            # Try extracting from endpoint
+            worker_ip=$(redis-cli --raw hget "node/${node_num}/vpn" endpoint 2>/dev/null | cut -d: -f1 || true)
+        fi
+        if [[ -z "$worker_ip" ]]; then
+            warning "Cannot determine IP for worker node ${node_num}, skipping"
+            continue
+        fi
+
+        echo ""
+        echo -e "${BOLD}>>>>>>>>>>> Worker Node ${node_num} (${worker_ip}) <<<<<<<<<<<${NC}"
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "root@${worker_ip}" "bash -s -- --worker" < "$SCRIPT_PATH" 2>&1 || {
+            warning "Failed to SSH into worker node ${node_num} (${worker_ip})"
+        }
+        echo -e "${BOLD}>>>>>>>>>>> End Worker Node ${node_num} <<<<<<<<<<<${NC}"
+    done
+fi
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+echo ""
+echo -e "${BOLD}=========================================${NC}"
+echo -e "${BOLD}Summary (Node ${NODE_ID})${NC}"
+echo -e "  Problems: ${RED}${PROBLEMS}${NC}"
+echo -e "  Warnings: ${YELLOW}${WARNINGS}${NC}"
+echo -e "${BOLD}=========================================${NC}"
+
+if [[ ${#PROBLEM_MSGS[@]} -gt 0 ]]; then
+    echo ""
+    echo -e "${RED}${BOLD}Problems:${NC}"
+    for msg in "${PROBLEM_MSGS[@]}"; do
+        echo -e "  ${RED}[PROBLEM]${NC} ${msg}"
+    done
+fi
+
+if [[ ${#WARNING_MSGS[@]} -gt 0 ]]; then
+    echo ""
+    echo -e "${YELLOW}${BOLD}Warnings:${NC}"
+    for msg in "${WARNING_MSGS[@]}"; do
+        echo -e "  ${YELLOW}[WARNING]${NC} ${msg}"
+    done
+fi
+
+if [[ $PROBLEMS -gt 0 ]]; then
+    exit 1
+fi
+
+exit 0
