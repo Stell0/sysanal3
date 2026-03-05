@@ -389,7 +389,7 @@ if [[ -n "$nethvoice_modules" ]]; then
         # --- Asterisk PJSIP contacts ---
         pjsip_out=$(runagent -m "$nv_mod" podman exec freepbx asterisk -rx 'pjsip show contacts' 2>/dev/null || true)
         if [[ -n "$pjsip_out" ]]; then
-            pjsip_count=$(echo "$pjsip_out" | grep -c '/sip:' || echo 0)
+            pjsip_count=$(echo "$pjsip_out" | grep -c '/sip:' || true)
             info "${nv_mod}: PJSIP registered contacts: ${pjsip_count}"
             if [[ "$pjsip_count" -eq 0 ]]; then
                 # Check if asterisk is actually running
