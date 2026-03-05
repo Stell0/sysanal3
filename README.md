@@ -7,7 +7,7 @@
 Run as **root** on a NethServer 8 node:
 
 ```bash
-curl https://raw.githubusercontent.com/Stell0/sysanal3/main/sysanal3 | sh
+bash <(curl -sfL https://raw.githubusercontent.com/Stell0/sysanal3/main/sysanal3)
 ```
 
 ## What it does

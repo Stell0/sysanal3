@@ -3,7 +3,7 @@
 # sysanal3 - NethServer 8 System Analyzer
 # Analyzes a NethServer 8 system and searches for known issues automatically.
 #
-# Usage: curl URL | bash
+# Usage: bash <(curl -sfL https://raw.githubusercontent.com/Stell0/sysanal3/main/sysanal3)
 #
 
 set -o pipefail
