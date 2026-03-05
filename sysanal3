@@ -168,24 +168,40 @@ if [[ "$NODE_ID" == "1" ]]; then
     IS_LEADER=1
 fi
 info "Node ${NODE_ID} of ${TOTAL_NODES} total node(s) (leader: $(if [[ $IS_LEADER -eq 1 ]]; then echo 'yes'; else echo 'no'; fi))"
-if [[ $IS_LEADER -eq 1 && $TOTAL_NODES -gt 1 ]]; then
-    info "Worker nodes will be analyzed after local checks"
+
+# Fetch installed modules from Redis (works on both leader and worker nodes).
+# Redis on workers runs as a replica — all cluster/* and module/* keys are
+# replicated from the leader, so read operations work everywhere.
+# Output format per line: id|source|version|module
+MODULES_ON_NODE=""
+_module_node_raw=$(redis-cli --raw HGETALL cluster/module_node 2>/dev/null || true)
+if [[ -n "$_module_node_raw" ]]; then
+    # HGETALL returns alternating key/value lines: module_id\nnode_id\n...
+    _prev_key=""
+    while IFS= read -r _line; do
+        if [[ -z "$_prev_key" ]]; then
+            _prev_key="$_line"
+        else
+            _mod_id="$_prev_key"
+            _mod_node="$_line"
+            _prev_key=""
+            # Only process modules on this node
+            [[ "$_mod_node" != "$NODE_ID" ]] && continue
+            # Get IMAGE_URL from module environment (</dev/null prevents redis-cli from consuming loop stdin)
+            _image_url=$(redis-cli --raw HGET "module/${_mod_id}/environment" IMAGE_URL </dev/null 2>/dev/null || true)
+            [[ -z "$_image_url" ]] && continue
+            # Parse: source = URL without tag, version = tag, module = last path component of source
+            _source="${_image_url%:*}"
+            _version="${_image_url##*:}"
+            _module="${_source##*/}"
+            MODULES_ON_NODE+="${_mod_id}|${_source}|${_version}|${_module}"$'\n'
+        fi
+    done <<< "$_module_node_raw"
+    # Sort and strip trailing newline
+    MODULES_ON_NODE=$(echo "$MODULES_ON_NODE" | sort | sed '/^$/d')
+else
+    warning "Cannot retrieve installed modules from Redis"
 fi
-
-# Fetch all installed modules via api-cli (JSON output)
-MODULES_JSON=$(api-cli run list-installed-modules 2>/dev/null || true)
-
-if [[ -z "$MODULES_JSON" ]] || ! echo "$MODULES_JSON" | jq empty 2>/dev/null; then
-    warning "Cannot retrieve installed modules (api-cli failed)"
-    MODULES_JSON="{}"
-fi
-
-# Extract modules on this node: id, source (image URL), version, module (base name)
-# Each line: id|source|version|module
-MODULES_ON_NODE=$(echo "$MODULES_JSON" | jq -r --arg nid "$NODE_ID" '
-    [.[][] | select(.node == $nid)] | sort_by(.id)[] |
-    "\(.id)|\(.source)|\(.version)|\(.module)"
-' 2>/dev/null || true)
 
 # Plain list of module IDs for later checks
 MODULES=$(echo "$MODULES_ON_NODE" | cut -d'|' -f1 | grep -v '^$' || true)
