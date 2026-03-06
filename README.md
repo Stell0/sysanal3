@@ -29,6 +29,8 @@ It exits with code `1` if any problem is found, otherwise `0`.
   - DNS resolution via `getent hosts ibm.com`.
   - MySQL integrity via `mysqlcheck`.
   - Asterisk PJSIP contacts count (warns if zero while Asterisk is running).
+  - AstDB call forward check (warns for each extension with `CF` enabled and flags circular forwarding chains as problems).
+  - Asterisk queue ring strategy check (warns if more than 3 queues use `ringall`, or any `ringall` queue has more than 5 agents).
   - Validates NethVoice `*PORT*` environment variables against listening processes (e.g. Asterisk/Kamailio ownership checks).
   - Verifies Asterisk expected listening ports, enforces that Asterisk is not listening on `5060`/`5061`, and checks PJSIP transport port alignment.
 - **Listening ports** — Verifies expected ports are in LISTEN state for installed services (Traefik 80/443, Samba 389/636, Mail 25/143/993) and checks NethVoice SIP/SIPS ports from module environment (`PROXY_PORT`, `ASTERISK_SIP_PORT`, `ASTERISK_SIPS_PORT`) with process-owner validation.
@@ -46,6 +48,8 @@ It exits with code `1` if any problem is found, otherwise `0`.
 |----------|---------|-------------|
 | `RESTART_THRESHOLD` | `5` | Container restart count above which a problem is flagged. |
 | `DNS_SLOW_MS` | `2000` | DNS resolution time (ms) above which a problem is flagged. |
+| `QUEUE_RINGALL_MAX_QUEUES` | `3` | Ringall queue count above which a warning is flagged. |
+| `QUEUE_RINGALL_MAX_AGENTS` | `5` | Agent count in a ringall queue above which a warning is flagged. |
 
 ## References
 

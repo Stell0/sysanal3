@@ -93,6 +93,8 @@ get_env_numeric_var() {
 # ---------------------------------------------------------------------------
 RESTART_THRESHOLD=5            # Container restarts above this count flag a problem
 DNS_SLOW_MS=2000               # DNS resolution slower than this (ms) flags a problem
+QUEUE_RINGALL_MAX_QUEUES=3     # Warn if ringall strategy is used by more than this number of queues
+QUEUE_RINGALL_MAX_AGENTS=5     # Warn if any ringall queue has more than this number of agents
 INTERNET_OK=1                  # Set to 0 if connectivity precheck fails
 IS_WORKER=0                    # Set to 1 when running via SSH on a worker node
 
@@ -459,6 +461,172 @@ if [[ -n "$nethvoice_modules" ]]; then
             fi
         else
             info "${nv_mod}: could not retrieve PJSIP contacts (Asterisk may not be running)"
+        fi
+
+        # --- Asterisk AstDB call forward (CF) ---
+        cf_out=$(runagent -m "$nv_mod" podman exec freepbx asterisk -rx 'database show CF' 2>/dev/null || true)
+        if [[ -n "$cf_out" ]]; then
+            cf_mappings=$(echo "$cf_out" | awk '
+                /^[[:space:]]*\/CF\// {
+                    line = $0
+                    sub(/^[[:space:]]*\/CF\//, "", line)
+                    split(line, parts, /[[:space:]]*:[[:space:]]*/)
+                    ext = parts[1]
+                    dest = parts[2]
+                    sub(/[[:space:]].*$/, "", ext)
+                    sub(/^[[:space:]]+/, "", dest)
+                    sub(/[[:space:]]+$/, "", dest)
+                    if (ext != "") {
+                        print ext "|" dest
+                    }
+                }
+            ' | sort -u)
+
+            if [[ -n "$cf_mappings" ]]; then
+                declare -A cf_targets=()
+                declare -A reported_cf_cycles=()
+
+                while IFS='|' read -r cf_ext cf_dest; do
+                    [[ -z "$cf_ext" ]] && continue
+                    cf_target=""
+                    if [[ "$cf_dest" =~ ^[0-9]+$ ]]; then
+                        cf_target="$cf_dest"
+                    elif [[ "$cf_dest" =~ (^|[^0-9])([0-9]{2,})([^0-9]|$) ]]; then
+                        cf_target="${BASH_REMATCH[2]}"
+                    fi
+
+                    cf_targets["$cf_ext"]="$cf_target"
+                    warning "${nv_mod}: Extension ${cf_ext} has call forward enabled"
+                done <<< "$cf_mappings"
+
+                for start_ext in "${!cf_targets[@]}"; do
+                    declare -A visited_cf=()
+                    cf_path=()
+                    current_ext="$start_ext"
+
+                    while [[ -n "$current_ext" && -n "${cf_targets[$current_ext]+x}" ]]; do
+                        if [[ -n "${visited_cf[$current_ext]+x}" ]]; then
+                            cycle_start_index=${visited_cf[$current_ext]}
+                            cycle_exts=( "${cf_path[@]:$cycle_start_index}" )
+                            cycle_desc=""
+                            for cycle_ext in "${cycle_exts[@]}"; do
+                                if [[ -n "$cycle_desc" ]]; then
+                                    cycle_desc+=" -> "
+                                fi
+                                cycle_desc+="$cycle_ext"
+                            done
+                            cycle_desc+=" -> ${current_ext}"
+
+                            for cycle_ext in "${cycle_exts[@]}"; do
+                                if [[ -z "${reported_cf_cycles[$cycle_ext]+x}" ]]; then
+                                    problem "${nv_mod}: Extension ${cycle_ext} has circular call forward configuration (${cycle_desc})"
+                                    reported_cf_cycles["$cycle_ext"]=1
+                                fi
+                            done
+                            break
+                        fi
+
+                        visited_cf["$current_ext"]=${#cf_path[@]}
+                        cf_path+=("$current_ext")
+                        next_ext="${cf_targets[$current_ext]}"
+                        if [[ -z "$next_ext" ]]; then
+                            break
+                        fi
+                        current_ext="$next_ext"
+                    done
+                done
+            else
+                ok "${nv_mod}: no extensions with call forward enabled (AstDB CF)"
+            fi
+        else
+            info "${nv_mod}: could not retrieve AstDB CF entries"
+        fi
+
+        # --- Asterisk queue ring strategy ---
+        queue_out=$(runagent -m "$nv_mod" podman exec freepbx asterisk -rx 'queue show' 2>/dev/null || true)
+        if [[ -n "$queue_out" ]]; then
+            ringall_queue_agents=$(echo "$queue_out" | awk -v sq="'" '
+                BEGIN {
+                    queue = ""
+                    is_ringall = 0
+                    in_members = 0
+                    agents = 0
+                }
+
+                function flush_queue() {
+                    if (is_ringall && queue != "") {
+                        print queue "|" agents
+                    }
+                }
+
+                /^[^[:space:]].* has .* strategy/ {
+                    flush_queue()
+                    queue = ""
+                    is_ringall = 0
+                    in_members = 0
+                    agents = 0
+
+                    if (match($0, /^(.+) has .* in /, m)) {
+                        queue = m[1]
+                    }
+                    if (index($0, " in " sq "ringall" sq " strategy") > 0) {
+                        is_ringall = 1
+                    }
+                    next
+                }
+
+                is_ringall && /^[[:space:]]+Members:[[:space:]]*$/ {
+                    in_members = 1
+                    next
+                }
+
+                is_ringall && /^[[:space:]]+Callers:[[:space:]]*$/ {
+                    in_members = 0
+                    next
+                }
+
+                is_ringall && in_members {
+                    if ($0 ~ /^[[:space:]]+[^[:space:]]+/ && $0 !~ /^[[:space:]]+No Members/) {
+                        agents++
+                    }
+                    next
+                }
+
+                END {
+                    flush_queue()
+                }
+            ')
+
+            ringall_queue_count=$(echo "$ringall_queue_agents" | sed '/^$/d' | wc -l)
+            max_ringall_agents=0
+            max_ringall_queue=""
+            ringall_over_limit=""
+
+            if [[ -n "$ringall_queue_agents" ]]; then
+                while IFS='|' read -r queue_name queue_agents; do
+                    [[ -z "$queue_name" ]] && continue
+                    [[ -z "$queue_agents" || ! "$queue_agents" =~ ^[0-9]+$ ]] && queue_agents=0
+
+                    if (( queue_agents > max_ringall_agents )); then
+                        max_ringall_agents=$queue_agents
+                        max_ringall_queue=$queue_name
+                    fi
+
+                    if (( queue_agents > QUEUE_RINGALL_MAX_AGENTS )); then
+                        ringall_over_limit+="${queue_name}(${queue_agents}) "
+                    fi
+                done <<< "$ringall_queue_agents"
+            fi
+
+            if (( ringall_queue_count > QUEUE_RINGALL_MAX_QUEUES )) || [[ -n "$ringall_over_limit" ]]; then
+                warning "${nv_mod}: Asterisk ringall strategy may overload endpoints (ringall queues: ${ringall_queue_count}, threshold: ${QUEUE_RINGALL_MAX_QUEUES}; queues with >${QUEUE_RINGALL_MAX_AGENTS} agents: ${ringall_over_limit:-none})"
+            elif (( ringall_queue_count > 0 )); then
+                info "${nv_mod}: ringall queues: ${ringall_queue_count} (max agents in a ringall queue: ${max_ringall_agents}${max_ringall_queue:+ in ${max_ringall_queue}})"
+            else
+                ok "${nv_mod}: no queues using ringall strategy"
+            fi
+        else
+            info "${nv_mod}: could not retrieve queue strategy data (Asterisk queue show unavailable)"
         fi
 
         # --- Port variables and service ownership checks ---
