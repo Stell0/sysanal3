@@ -466,6 +466,9 @@ if [[ -n "$nethvoice_modules" ]]; then
         # --- Asterisk AstDB call forward (CF) ---
         cf_out=$(runagent -m "$nv_mod" podman exec freepbx asterisk -rx 'database show CF' 2>/dev/null || true)
         if [[ -n "$cf_out" ]]; then
+            # Parse AstDB output lines like:
+            #   /CF/200                                       : 210
+            # and keep a unique extension|destination mapping for later checks.
             cf_mappings=$(echo "$cf_out" | awk '
                 /^[[:space:]]*\/CF\// {
                     line = $0
@@ -488,6 +491,9 @@ if [[ -n "$nethvoice_modules" ]]; then
 
                 while IFS='|' read -r cf_ext cf_dest; do
                     [[ -z "$cf_ext" ]] && continue
+                    # Keep only a numeric extension target so we can walk CF chains.
+                    # If the destination is external or non-numeric, the extension still
+                    # gets a warning but it is not considered for circular-chain checks.
                     cf_target=""
                     if [[ "$cf_dest" =~ ^[0-9]+$ ]]; then
                         cf_target="$cf_dest"
@@ -499,6 +505,8 @@ if [[ -n "$nethvoice_modules" ]]; then
                     warning "${nv_mod}: Extension ${cf_ext} has call forward enabled"
                 done <<< "$cf_mappings"
 
+                # Follow each extension CF chain until it ends or loops back to a
+                # previously visited extension. A repeated node means a circular CF.
                 for start_ext in "${!cf_targets[@]}"; do
                     declare -A visited_cf=()
                     cf_path=()
@@ -545,6 +553,8 @@ if [[ -n "$nethvoice_modules" ]]; then
         # --- Asterisk queue ring strategy ---
         queue_out=$(runagent -m "$nv_mod" podman exec freepbx asterisk -rx 'queue show' 2>/dev/null || true)
         if [[ -n "$queue_out" ]]; then
+            # Parse `queue show` output queue-by-queue and count members only for
+            # queues whose strategy is explicitly set to `ringall`.
             ringall_queue_agents=$(echo "$queue_out" | awk -v sq="'" '
                 BEGIN {
                     queue = ""
@@ -603,6 +613,9 @@ if [[ -n "$nethvoice_modules" ]]; then
             ringall_over_limit=""
 
             if [[ -n "$ringall_queue_agents" ]]; then
+                # Evaluate both warning conditions:
+                # 1. too many queues using ringall
+                # 2. any ringall queue with too many agents
                 while IFS='|' read -r queue_name queue_agents; do
                     [[ -z "$queue_name" ]] && continue
                     [[ -z "$queue_agents" || ! "$queue_agents" =~ ^[0-9]+$ ]] && queue_agents=0
@@ -731,6 +744,8 @@ if [[ -n "$nethvoice_modules" ]]; then
             esac
         done <<< "$nv_port_vars"
 
+        # Compare configured Asterisk ports from the module environment with the
+        # actual ports currently owned by the asterisk process on the host.
         expected_asterisk_ports=$(echo "$nv_port_vars" | awk -F= '/^(ASTERISK_SIP_PORT|ASTERISK_SIPS_PORT|ASTERISK_IAX_PORT|ASTERISK_WS_PORT|ASTERISK_WSS_PORT|ASTMANAGERPORT)=/{print $2}' | sort -n -u | xargs)
         asterisk_listeners=$(ss -H -ltnup 2>/dev/null | grep 'users:(("asterisk"' || true)
         actual_asterisk_ports=$(echo "$asterisk_listeners" | awk '{print $5}' | awk -F: '{print $NF}' | grep -E '^[0-9]+$' | sort -n -u | xargs)
