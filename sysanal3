@@ -482,6 +482,31 @@ if [[ -n "$nethvoice_modules" ]]; then
             fi
         fi
 
+        satellite_service_running=0
+        satellite_mqtt_service_running=0
+        satellite_pgsql_service_running=0
+
+        if [[ -n "$(echo "$nv_port_vars" | grep -E '^(SATELLITE_HTTP_PORT|SATELLITE_RTP_PORT)=' || true)" ]]; then
+            satellite_state=$(runagent -m "$nv_mod" systemctl --user is-active satellite.service 2>/dev/null | head -1 || true)
+            if [[ "$satellite_state" == "active" ]]; then
+                satellite_service_running=1
+            fi
+        fi
+
+        if [[ -n "$(echo "$nv_port_vars" | grep '^SATELLITE_MQTT_PORT=' || true)" ]]; then
+            satellite_mqtt_state=$(runagent -m "$nv_mod" systemctl --user is-active satellite-mqtt.service 2>/dev/null | head -1 || true)
+            if [[ "$satellite_mqtt_state" == "active" ]]; then
+                satellite_mqtt_service_running=1
+            fi
+        fi
+
+        if [[ -n "$(echo "$nv_port_vars" | grep '^SATELLITE_PGSQL_PORT=' || true)" ]]; then
+            satellite_pgsql_state=$(runagent -m "$nv_mod" systemctl --user is-active satellite-pgsql.service 2>/dev/null | head -1 || true)
+            if [[ "$satellite_pgsql_state" == "active" ]]; then
+                satellite_pgsql_service_running=1
+            fi
+        fi
+
         info "${nv_mod}: PORT variables and listening processes"
         while IFS='=' read -r nv_var nv_port; do
             [[ -z "$nv_var" || -z "$nv_port" ]] && continue
@@ -492,6 +517,26 @@ if [[ -n "$nethvoice_modules" ]]; then
 
             if [[ "$nv_var" == "ASTERISK_RECORDING_SFTP_PORT" && "$sftp_service_enabled" -ne 1 ]]; then
                 info "${nv_mod}: ${nv_var}=${nv_port} skipped (sftp.service is not enabled)"
+                continue
+            fi
+
+            if [[ "$nv_var" == "SATELLITE_HTTP_PORT" && "$satellite_service_running" -ne 1 ]]; then
+                info "${nv_mod}: ${nv_var}=${nv_port} skipped (satellite.service is not running)"
+                continue
+            fi
+
+            if [[ "$nv_var" == "SATELLITE_RTP_PORT" && "$satellite_service_running" -ne 1 ]]; then
+                info "${nv_mod}: ${nv_var}=${nv_port} skipped (satellite.service is not running)"
+                continue
+            fi
+
+            if [[ "$nv_var" == "SATELLITE_MQTT_PORT" && "$satellite_mqtt_service_running" -ne 1 ]]; then
+                info "${nv_mod}: ${nv_var}=${nv_port} skipped (satellite-mqtt.service is not running)"
+                continue
+            fi
+
+            if [[ "$nv_var" == "SATELLITE_PGSQL_PORT" && "$satellite_pgsql_service_running" -ne 1 ]]; then
+                info "${nv_mod}: ${nv_var}=${nv_port} skipped (satellite-pgsql.service is not running)"
                 continue
             fi
 
@@ -528,13 +573,13 @@ if [[ -n "$nethvoice_modules" ]]; then
                     problem "${nv_mod}: asterisk is not listening on expected port ${expected_port}"
                 fi
             done
-
-            for actual_port in $actual_asterisk_ports; do
-                if ! echo " ${expected_asterisk_ports} " | grep -q " ${actual_port} "; then
-                    problem "${nv_mod}: asterisk is listening on unexpected port ${actual_port} (not declared by ASTERISK_* / ASTMANAGERPORT)"
-                fi
-            done
         fi
+
+        for forbidden_port in 5060 5061; do
+            if echo " ${actual_asterisk_ports} " | grep -q " ${forbidden_port} "; then
+                problem "${nv_mod}: asterisk must not listen on forbidden port ${forbidden_port}"
+            fi
+        done
 
         expected_sip_port=$(get_env_numeric_var "$nv_env_file" "ASTERISK_SIP_PORT")
         if [[ -n "$expected_sip_port" ]]; then
