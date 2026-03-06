@@ -166,6 +166,18 @@ if [[ -n "$_root_pct" && "$_root_pct" -ge 90 ]]; then
     problem "Root filesystem usage at ${_root_pct}% (>= 90%)"
 fi
 
+# CPU load average
+_cpu_cores=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || true)
+_load_avg_1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || true)
+if [[ -n "$_cpu_cores" && -n "$_load_avg_1" ]]; then
+    info "CPU load average (1m): ${_load_avg_1} on ${_cpu_cores} core(s)"
+    if awk -v load_avg="$_load_avg_1" -v cores="$_cpu_cores" 'BEGIN { exit !(load_avg > (2 * cores)) }'; then
+        problem "CPU load average is ${_load_avg_1} on ${_cpu_cores} core(s) (> 2x core count)"
+    elif awk -v load_avg="$_load_avg_1" -v cores="$_cpu_cores" 'BEGIN { exit !(load_avg > cores) }'; then
+        warning "CPU load average is ${_load_avg_1} on ${_cpu_cores} core(s) (> core count)"
+    fi
+fi
+
 # Uptime
 info "Uptime: $(uptime -p 2>/dev/null || uptime | sed 's/.*up/up/' || echo 'N/A')"
 
