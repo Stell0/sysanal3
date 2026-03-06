@@ -29,6 +29,65 @@ info()    { echo -e "${CYAN}[INFO]${NC} $*"; }
 ok()      { echo -e "${GREEN}[OK]${NC} $*"; }
 header()  { echo ""; echo -e "${BOLD}=== $* ===${NC}"; }
 
+get_listener_lines_by_port() {
+    local port="$1"
+    {
+        ss -H -ltnp "( sport = :${port} )" 2>/dev/null
+        ss -H -lunp "( sport = :${port} )" 2>/dev/null
+    } | sed '/^$/d'
+}
+
+get_listener_processes_by_port() {
+    local port="$1"
+    local listeners
+    listeners=$(get_listener_lines_by_port "$port")
+    if [[ -z "$listeners" ]]; then
+        return
+    fi
+    echo "$listeners" | grep -oE '"[^"]+"' | tr -d '"' | sort -u | xargs
+}
+
+check_port() {
+    local desc="$1" port="$2"
+    local listeners processes
+    listeners=$(get_listener_lines_by_port "$port")
+    if [[ -n "$listeners" ]]; then
+        processes=$(get_listener_processes_by_port "$port")
+        if [[ -n "$processes" ]]; then
+            ok "${desc}: port ${port} is listening (processes: ${processes})"
+        else
+            ok "${desc}: port ${port} is listening"
+        fi
+    else
+        problem "${desc}: port ${port} is NOT listening"
+    fi
+}
+
+check_port_owner() {
+    local desc="$1" port="$2" expected_regex="$3" expected_service="$4"
+    local listeners processes
+    listeners=$(get_listener_lines_by_port "$port")
+    processes=$(get_listener_processes_by_port "$port")
+
+    if [[ -z "$listeners" ]]; then
+        problem "${desc}: port ${port} is NOT listening"
+        return 1
+    fi
+
+    if [[ -n "$expected_regex" ]] && ! echo " ${processes} " | grep -qiE "$expected_regex"; then
+        problem "${desc}: port ${port} is used by [${processes:-unknown}] instead of ${expected_service}"
+        return 1
+    fi
+
+    ok "${desc}: port ${port} is listening (processes: ${processes:-unknown})"
+    return 0
+}
+
+get_env_numeric_var() {
+    local env_file="$1" var_name="$2"
+    grep -oP "^${var_name}=\K[0-9]+$" "$env_file" 2>/dev/null | head -1
+}
+
 # ---------------------------------------------------------------------------
 # Configurable constants
 # ---------------------------------------------------------------------------
@@ -295,7 +354,7 @@ if [[ -n "$MODULES" ]]; then
         done <<< "$container_info"
 
         # Show TRAEFIK_HOST if present
-        _traefik_host=$(cat ~"${mod}"/.config/state/environment 2>/dev/null | grep -oP '^TRAEFIK_HOST=\K.*' || true)
+        _traefik_host=$(cat "/home/${mod}/.config/state/environment" 2>/dev/null | grep -oP '^TRAEFIK_HOST=\K.*' || true)
         if [[ -n "$_traefik_host" ]]; then
             info "${mod}: TRAEFIK_HOST=${_traefik_host}"
         fi
@@ -401,6 +460,93 @@ if [[ -n "$nethvoice_modules" ]]; then
         else
             info "${nv_mod}: could not retrieve PJSIP contacts (Asterisk may not be running)"
         fi
+
+        # --- Port variables and service ownership checks ---
+        nv_env_file="/home/${nv_mod}/.config/state/environment"
+        if [[ ! -f "$nv_env_file" ]]; then
+            warning "${nv_mod}: cannot read environment file (${nv_env_file}) for port checks"
+            continue
+        fi
+
+        nv_port_vars=$(grep -E '^[A-Z0-9_]*PORT[A-Z0-9_]*=[0-9]+$' "$nv_env_file" 2>/dev/null || true)
+        if [[ -z "$nv_port_vars" ]]; then
+            warning "${nv_mod}: no numeric *PORT* variables found in environment"
+            continue
+        fi
+
+        sftp_service_enabled=0
+        if [[ -n "$(echo "$nv_port_vars" | grep '^ASTERISK_RECORDING_SFTP_PORT=' || true)" ]]; then
+            sftp_state=$(runagent -m "$nv_mod" systemctl --user is-enabled sftp.service 2>/dev/null | head -1 || true)
+            if [[ "$sftp_state" == "enabled" ]]; then
+                sftp_service_enabled=1
+            fi
+        fi
+
+        info "${nv_mod}: PORT variables and listening processes"
+        while IFS='=' read -r nv_var nv_port; do
+            [[ -z "$nv_var" || -z "$nv_port" ]] && continue
+
+            if [[ "$nv_var" == "STUNPORT" ]]; then
+                continue
+            fi
+
+            if [[ "$nv_var" == "ASTERISK_RECORDING_SFTP_PORT" && "$sftp_service_enabled" -ne 1 ]]; then
+                info "${nv_mod}: ${nv_var}=${nv_port} skipped (sftp.service is not enabled)"
+                continue
+            fi
+
+            nv_processes=$(get_listener_processes_by_port "$nv_port")
+
+            if [[ -n "$nv_processes" ]]; then
+                info "${nv_mod}: ${nv_var}=${nv_port} -> ${nv_processes}"
+            else
+                problem "${nv_mod}: ${nv_var}=${nv_port} is not used by any listening process"
+                continue
+            fi
+
+            case "$nv_var" in
+                ASTERISK_SIP_PORT|ASTERISK_SIPS_PORT|ASTERISK_IAX_PORT|ASTERISK_WS_PORT|ASTERISK_WSS_PORT|ASTMANAGERPORT)
+                    if ! echo " ${nv_processes} " | grep -qiE '(^| )asterisk( |$)'; then
+                        problem "${nv_mod}: ${nv_var}=${nv_port} is not used by asterisk (found: ${nv_processes})"
+                    fi
+                    ;;
+                PROXY_PORT)
+                    if ! echo " ${nv_processes} " | grep -qiE '(^| )kamailio( |$)'; then
+                        problem "${nv_mod}: ${nv_var}=${nv_port} is not used by kamailio (found: ${nv_processes})"
+                    fi
+                    ;;
+            esac
+        done <<< "$nv_port_vars"
+
+        expected_asterisk_ports=$(echo "$nv_port_vars" | awk -F= '/^(ASTERISK_SIP_PORT|ASTERISK_SIPS_PORT|ASTERISK_IAX_PORT|ASTERISK_WS_PORT|ASTERISK_WSS_PORT|ASTMANAGERPORT)=/{print $2}' | sort -n -u | xargs)
+        asterisk_listeners=$(ss -H -ltnup 2>/dev/null | grep 'users:(("asterisk"' || true)
+        actual_asterisk_ports=$(echo "$asterisk_listeners" | awk '{print $5}' | awk -F: '{print $NF}' | grep -E '^[0-9]+$' | sort -n -u | xargs)
+
+        if [[ -n "$expected_asterisk_ports" ]]; then
+            for expected_port in $expected_asterisk_ports; do
+                if ! echo " ${actual_asterisk_ports} " | grep -q " ${expected_port} "; then
+                    problem "${nv_mod}: asterisk is not listening on expected port ${expected_port}"
+                fi
+            done
+
+            for actual_port in $actual_asterisk_ports; do
+                if ! echo " ${expected_asterisk_ports} " | grep -q " ${actual_port} "; then
+                    problem "${nv_mod}: asterisk is listening on unexpected port ${actual_port} (not declared by ASTERISK_* / ASTMANAGERPORT)"
+                fi
+            done
+        fi
+
+        expected_sip_port=$(get_env_numeric_var "$nv_env_file" "ASTERISK_SIP_PORT")
+        if [[ -n "$expected_sip_port" ]]; then
+            pjsip_transports=$(runagent -m "$nv_mod" podman exec freepbx asterisk -rx 'pjsip show transports' 2>/dev/null || true)
+            if [[ -n "$pjsip_transports" ]]; then
+                if echo "$pjsip_transports" | grep -qE ":[[:space:]]*${expected_sip_port}([[:space:]]|$)|:${expected_sip_port}/"; then
+                    ok "${nv_mod}: Asterisk PJSIP transport uses ASTERISK_SIP_PORT=${expected_sip_port}"
+                else
+                    problem "${nv_mod}: Asterisk PJSIP transport does not use ASTERISK_SIP_PORT=${expected_sip_port}"
+                fi
+            fi
+        fi
     done <<< "$nethvoice_modules"
 else
     info "No NethVoice modules found"
@@ -411,15 +557,6 @@ fi
 # ---------------------------------------------------------------------------
 header "Check: Listening ports for installed services"
 
-check_port() {
-    local desc="$1" port="$2"
-    if ss -Hltn src :"${port}" 2>/dev/null | grep -q LISTEN; then
-        ok "${desc}: port ${port} is listening"
-    else
-        problem "${desc}: port ${port} is NOT listening"
-    fi
-}
-
 # Traefik (always expected on NS8)
 traefik_modules=$(echo "$MODULES" | grep -i "^traefik" || true)
 if [[ -n "$traefik_modules" ]]; then
@@ -429,8 +566,35 @@ fi
 
 # NethVoice SIP ports
 if [[ -n "$nethvoice_modules" ]]; then
-    check_port "NethVoice SIP (UDP/TCP)" 5060
-    check_port "NethVoice SIP-TLS" 5061
+    while read -r nv_mod; do
+        nv_env_file="/home/${nv_mod}/.config/state/environment"
+        if [[ ! -f "$nv_env_file" ]]; then
+            warning "${nv_mod}: cannot read environment file (${nv_env_file}) for NethVoice port checks"
+            continue
+        fi
+
+        proxy_port=$(get_env_numeric_var "$nv_env_file" "PROXY_PORT")
+        asterisk_sip_port=$(get_env_numeric_var "$nv_env_file" "ASTERISK_SIP_PORT")
+        asterisk_sips_port=$(get_env_numeric_var "$nv_env_file" "ASTERISK_SIPS_PORT")
+
+        if [[ -n "$proxy_port" ]]; then
+            check_port_owner "${nv_mod} Kamailio SIP" "$proxy_port" '(^| )kamailio( |$)' "kamailio"
+        else
+            warning "${nv_mod}: PROXY_PORT is not set"
+        fi
+
+        if [[ -n "$asterisk_sip_port" ]]; then
+            check_port_owner "${nv_mod} Asterisk SIP" "$asterisk_sip_port" '(^| )asterisk( |$)' "asterisk"
+        else
+            warning "${nv_mod}: ASTERISK_SIP_PORT is not set"
+        fi
+
+        if [[ -n "$asterisk_sips_port" ]]; then
+            check_port_owner "${nv_mod} Asterisk SIPS" "$asterisk_sips_port" '(^| )asterisk( |$)' "asterisk"
+        else
+            warning "${nv_mod}: ASTERISK_SIPS_PORT is not set"
+        fi
+    done <<< "$nethvoice_modules"
 fi
 
 # Samba / NethService AD

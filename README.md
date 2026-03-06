@@ -1,6 +1,6 @@
 # sysanal3
 
-**NethServer 8 System Analyzer** — Analyzes a NethServer 8 system and automatically searches for known issues.
+**NethServer 8 System Analyzer V3** — Analyzes a NethServer 8 system and automatically searches for known issues.
 
 ## Quick Start
 
@@ -13,6 +13,7 @@ bash <(curl -sfL https://raw.githubusercontent.com/Stell0/sysanal3/main/sysanal3
 ## What it does
 
 The script executes a series of automated checks and reports all detected **problems** and **warnings**.
+It exits with code `1` if any problem is found, otherwise `0`.
 
 ### Checks performed
 
@@ -28,15 +29,16 @@ The script executes a series of automated checks and reports all detected **prob
   - DNS resolution via `getent hosts ibm.com`.
   - MySQL integrity via `mysqlcheck`.
   - Asterisk PJSIP contacts count (warns if zero while Asterisk is running).
-- **Listening ports** — Verifies expected ports are in LISTEN state for installed services (Traefik 80/443, NethVoice 5060/5061, Samba 389/636, Mail 25/143/993).
+  - Validates NethVoice `*PORT*` environment variables against listening processes (e.g. Asterisk/Kamailio ownership checks).
+  - Verifies Asterisk expected vs unexpected listening ports and PJSIP transport port alignment.
+- **Listening ports** — Verifies expected ports are in LISTEN state for installed services (Traefik 80/443, Samba 389/636, Mail 25/143/993) and checks NethVoice SIP/SIPS ports from module environment (`PROXY_PORT`, `ASTERISK_SIP_PORT`, `ASTERISK_SIPS_PORT`) with process-owner validation.
 - **CrowdSec** — If present, checks whether any local IP is blocked.
-- **Multi-node support** — On the leader node, SSHes into each worker and re-runs itself with `--worker`.
 
 ## Arguments
 
 | Flag | Description |
 |------|-------------|
-| `--worker` | Indicates the script is running remotely on a worker node (skips re-SSHing into workers). |
+| `--worker` | Parsed for compatibility; currently does not change check flow in this script version. |
 
 ## Configurable constants
 
@@ -53,3 +55,6 @@ The script executes a series of automated checks and reports all detected **prob
 ## License
 
 See the [repository](https://github.com/Stell0/sysanal3) for license details.
+
+## Credits
+- Thanks to Nick and NethAnal for inspiring this project and providing part of the codebase.
