@@ -208,12 +208,12 @@ check_hairpin_nat_for_nethvoice() {
     fi
 
     for port in 5060 5061 10001; do
-        if ! is_port_listening "$port"; then
+        if [[ "$port" != "10001" ]] && ! is_port_listening "$port"; then
             info "${nv_mod}: hairpin NAT check skipped for port ${port}: port is not listening"
             continue
         fi
 
-        if ! is_port_listening_by_process "$port" "$expected_regex"; then
+        if [[ "$port" != "10001" ]] && ! is_port_listening_by_process "$port" "$expected_regex"; then
             processes=$(get_listener_processes_by_port "$port")
             info "${nv_mod}: hairpin NAT check skipped for port ${port}: port is owned by [${processes:-unknown}] instead of kamailio"
             continue
@@ -241,7 +241,12 @@ check_hairpin_nat_for_nethvoice() {
                 fi
                 ;;
             10001)
-                warning "${nv_mod}: hairpin NAT check for UDP port ${port} is inconclusive: kamailio is listening on ${PUBLIC_IP}:${port}, but no deterministic reply-based probe is available"
+                if is_port_listening_by_process "$port" "$expected_regex"; then
+                    warning "${nv_mod}: hairpin NAT check for UDP port ${port} is inconclusive: kamailio is listening on ${PUBLIC_IP}:${port}, but no deterministic reply-based probe is available"
+                else
+                    processes=$(get_listener_processes_by_port "$port")
+                    warning "${nv_mod}: hairpin NAT check for UDP port ${port} is inconclusive: no kamailio listener was found locally (found: ${processes:-none}), and no deterministic reply-based probe is available"
+                fi
                 ;;
         esac
     done
