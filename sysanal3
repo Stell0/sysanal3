@@ -140,10 +140,6 @@ probe_hairpin_udp_sip() {
     local public_ip="$1" port="$2"
     local payload response branch tag call_id
 
-    if ! command -v nc >/dev/null 2>&1; then
-        return 2
-    fi
-
     branch="z9hG4bK-sysanal3-$$-$RANDOM"
     tag="sysanal3-$RANDOM"
     call_id="sysanal3-$RANDOM-$$"
@@ -158,7 +154,26 @@ probe_hairpin_udp_sip() {
         printf 'Max-Forwards: 70\r\n'
         printf 'Content-Length: 0\r\n\r\n'
     )
-    response=$(printf '%s' "$payload" | timeout 5 nc -u -w 3 "$public_ip" "$port" 2>/dev/null || true)
+
+    if ! exec 3<>"/dev/udp/${public_ip}/${port}" 2>/dev/null; then
+        return 2
+    fi
+
+    printf '%s' "$payload" >&3 || {
+        exec 3>&-
+        exec 3<&-
+        return 1
+    }
+
+    response=""
+    if ! IFS= read -r -t 4 response <&3; then
+        exec 3>&-
+        exec 3<&-
+        return 1
+    fi
+
+    exec 3>&-
+    exec 3<&-
 
     if echo "$response" | grep -qE '^SIP/2\.0 [0-9]{3}'; then
         return 0
@@ -210,7 +225,7 @@ check_hairpin_nat_for_nethvoice() {
                     ok "${nv_mod}: hairpin NAT works for SIP/UDP port ${port} via ${PUBLIC_IP}"
                 else
                     case $? in
-                        2) info "${nv_mod}: hairpin NAT check skipped for SIP/UDP port ${port}: nc is not available" ;;
+                        2) info "${nv_mod}: hairpin NAT check skipped for SIP/UDP port ${port}: /dev/udp is not available" ;;
                         *) problem "${nv_mod}: hairpin NAT failed for SIP/UDP port ${port} via ${PUBLIC_IP}" ;;
                     esac
                 fi
