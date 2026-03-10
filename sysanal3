@@ -22,12 +22,16 @@ PROBLEMS=0
 WARNINGS=0
 declare -a PROBLEM_MSGS=()
 declare -a WARNING_MSGS=()
+declare -a LOCAL_IPS_ARRAY=()
 
 problem() { echo -e "${RED}[PROBLEM]${NC} $*"; PROBLEM_MSGS+=("$*"); ((PROBLEMS++)); }
 warning() { echo -e "${YELLOW}[WARNING]${NC} $*"; WARNING_MSGS+=("$*"); ((WARNINGS++)); }
 info()    { echo -e "${CYAN}[INFO]${NC} $*"; }
 ok()      { echo -e "${GREEN}[OK]${NC} $*"; }
 header()  { echo ""; echo -e "${BOLD}=== $* ===${NC}"; }
+
+LOCAL_IPS_DISPLAY="N/A"
+PUBLIC_IP=""
 
 get_listener_lines_by_port() {
     local port="$1"
@@ -83,6 +87,151 @@ check_port_owner() {
     return 0
 }
 
+init_network_identity() {
+    local raw_ips ip
+    raw_ips=$(hostname -I 2>/dev/null | xargs || true)
+
+    LOCAL_IPS_ARRAY=()
+    if [[ -n "$raw_ips" ]]; then
+        read -r -a LOCAL_IPS_ARRAY <<< "$raw_ips"
+        LOCAL_IPS_DISPLAY="$raw_ips"
+    fi
+
+    PUBLIC_IP=""
+    if ! command -v curl >/dev/null 2>&1; then
+        return
+    fi
+
+    for ip_service in \
+        "https://api64.ipify.org" \
+        "https://ipv4.icanhazip.com" \
+        "https://ifconfig.me/ip"
+    do
+        ip=$(curl -4 -fsS --max-time 5 "$ip_service" 2>/dev/null | tr -d '[:space:]' || true)
+        if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            PUBLIC_IP="$ip"
+            return
+        fi
+    done
+}
+
+is_local_ip() {
+    local candidate="$1" ip
+    [[ -z "$candidate" ]] && return 1
+    for ip in "${LOCAL_IPS_ARRAY[@]}"; do
+        [[ "$candidate" == "$ip" ]] && return 0
+    done
+    return 1
+}
+
+is_port_listening() {
+    local port="$1"
+    [[ -n "$(get_listener_lines_by_port "$port")" ]]
+}
+
+is_port_listening_by_process() {
+    local port="$1" expected_regex="$2"
+    local processes
+    processes=$(get_listener_processes_by_port "$port")
+    [[ -n "$processes" ]] && echo " ${processes} " | grep -qiE "$expected_regex"
+}
+
+probe_hairpin_udp_sip() {
+    local public_ip="$1" port="$2"
+    local payload response branch tag call_id
+
+    if ! command -v nc >/dev/null 2>&1; then
+        return 2
+    fi
+
+    branch="z9hG4bK-sysanal3-$$-$RANDOM"
+    tag="sysanal3-$RANDOM"
+    call_id="sysanal3-$RANDOM-$$"
+    payload=$(
+        printf 'OPTIONS sip:%s SIP/2.0\r\n' "$public_ip"
+        printf 'Via: SIP/2.0/UDP %s;branch=%s\r\n' "$public_ip" "$branch"
+        printf 'From: <sip:sysanal3@%s>;tag=%s\r\n' "$public_ip" "$tag"
+        printf 'To: <sip:sysanal3@%s>\r\n' "$public_ip"
+        printf 'Call-ID: %s\r\n' "$call_id"
+        printf 'CSeq: 1 OPTIONS\r\n'
+        printf 'Contact: <sip:sysanal3@%s>\r\n' "$public_ip"
+        printf 'Max-Forwards: 70\r\n'
+        printf 'Content-Length: 0\r\n\r\n'
+    )
+    response=$(printf '%s' "$payload" | timeout 5 nc -u -w 3 "$public_ip" "$port" 2>/dev/null || true)
+
+    if echo "$response" | grep -qE '^SIP/2\.0 [0-9]{3}'; then
+        return 0
+    fi
+
+    return 1
+}
+
+probe_hairpin_tcp_tls() {
+    local public_ip="$1" port="$2"
+
+    if ! command -v openssl >/dev/null 2>&1; then
+        return 2
+    fi
+
+    timeout 6 openssl s_client -connect "${public_ip}:${port}" -brief </dev/null >/dev/null 2>&1
+}
+
+check_hairpin_nat_for_nethvoice() {
+    local nv_mod="$1"
+    local port processes
+    local expected_regex='(^| )kamailio( |$)'
+
+    if [[ -z "$PUBLIC_IP" ]]; then
+        info "${nv_mod}: hairpin NAT checks skipped: public IP not available"
+        return
+    fi
+
+    if is_local_ip "$PUBLIC_IP"; then
+        info "${nv_mod}: hairpin NAT checks skipped: public IP matches a local machine address (${PUBLIC_IP})"
+        return
+    fi
+
+    for port in 5060 5061 10001; do
+        if ! is_port_listening "$port"; then
+            info "${nv_mod}: hairpin NAT check skipped for port ${port}: port is not listening"
+            continue
+        fi
+
+        if ! is_port_listening_by_process "$port" "$expected_regex"; then
+            processes=$(get_listener_processes_by_port "$port")
+            info "${nv_mod}: hairpin NAT check skipped for port ${port}: port is owned by [${processes:-unknown}] instead of kamailio"
+            continue
+        fi
+
+        case "$port" in
+            5060)
+                if probe_hairpin_udp_sip "$PUBLIC_IP" "$port"; then
+                    ok "${nv_mod}: hairpin NAT works for SIP/UDP port ${port} via ${PUBLIC_IP}"
+                else
+                    case $? in
+                        2) info "${nv_mod}: hairpin NAT check skipped for SIP/UDP port ${port}: nc is not available" ;;
+                        *) problem "${nv_mod}: hairpin NAT failed for SIP/UDP port ${port} via ${PUBLIC_IP}" ;;
+                    esac
+                fi
+                ;;
+            5061)
+                if probe_hairpin_tcp_tls "$PUBLIC_IP" "$port"; then
+                    ok "${nv_mod}: hairpin NAT works for SIP/TLS port ${port} via ${PUBLIC_IP}"
+                else
+                    case $? in
+                        2) info "${nv_mod}: hairpin NAT check skipped for SIP/TLS port ${port}: openssl is not available" ;;
+                        *) problem "${nv_mod}: hairpin NAT failed for SIP/TLS port ${port} via ${PUBLIC_IP}" ;;
+                    esac
+                fi
+                ;;
+            10001)
+                warning "${nv_mod}: hairpin NAT check for UDP port ${port} is inconclusive: kamailio is listening on ${PUBLIC_IP}:${port}, but no deterministic reply-based probe is available"
+                ;;
+        esac
+    done
+}
+
 get_env_numeric_var() {
     local env_file="$1" var_name="$2"
     grep -oP "^${var_name}=\K[0-9]+$" "$env_file" 2>/dev/null | head -1
@@ -120,6 +269,8 @@ echo -e "${BOLD}sysanal3 - NethServer 8 System Analyzer${NC}"
 echo "========================================="
 echo "Date: $(date)"
 
+init_network_identity
+
 # ---------------------------------------------------------------------------
 # Internet connectivity precheck
 # ---------------------------------------------------------------------------
@@ -138,7 +289,11 @@ fi
 header "General System Data"
 
 # IP addresses
-info "IP addresses: $(hostname -I 2>/dev/null | xargs || echo 'N/A')"
+info "IP addresses: ${LOCAL_IPS_DISPLAY}"
+info "Public IP: ${PUBLIC_IP:-unavailable}"
+if [[ -z "$PUBLIC_IP" ]]; then
+    warning "Public IP could not be determined; hairpin NAT checks will be skipped"
+fi
 
 # DNS nameservers
 _nameservers=$(grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | xargs || true)
@@ -834,6 +989,8 @@ if [[ -n "$nethvoice_modules" ]]; then
         else
             warning "${nv_mod}: ASTERISK_SIPS_PORT is not set"
         fi
+
+        check_hairpin_nat_for_nethvoice "$nv_mod"
     done <<< "$nethvoice_modules"
 fi
 
