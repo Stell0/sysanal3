@@ -31,7 +31,7 @@ It exits with code `1` if problems are found, otherwise `0`.
 ## List of checks
 
 - **Internet connectivity precheck**: `ping -qc 1 -W 3 sos.nethesis.it`. If unreachable, GitHub version checks are skipped.
-- **General System Data**: IP addresses, DNS nameservers, hostname/FQDN, open file descriptors, root filesystem usage, CPU load average (warns if 1-minute load is above the core count, problem if above 2x the core count), uptime, timezone, cluster subscription `system_id` (warns if missing), cluster UUID.
+- **General System Data**: IP addresses, DNS nameservers, hostname/FQDN, open file descriptors, root filesystem usage, `/home` filesystem usage when `/home` is a separate mount, CPU load average (warns if 1-minute load is above the core count, problem if above 2x the core count), uptime, timezone, cluster subscription `system_id` (warns if missing), cluster UUID.
 - Check for `sngrep` instances running for more than 1 day.
 - List all modules in this node.
 - For all modules, check if the installed version is older than the latest released version (latest release from GitHub). Skipped if no internet.
@@ -42,6 +42,7 @@ It exits with code `1` if problems are found, otherwise `0`.
 	- Check DNS by running `getent hosts ibm.com`.
 	- Run `mysqlcheck`.
 	- **MariaDB `asterisk.kvstore_Sipsettings` localnets**: Flags a problem if a `localnets` row exists.
+	- **FreePBX email sender**: Warns if neither `SMTP_FROM_ADDRESS=...` in the `freepbx` container nor `/etc/asterisk/voicemail.conf` `mailcmd=/var/lib/asterisk/bin/send_email -f ...` is configured.
 	- **Asterisk PJSIP contacts**: Counts registered PJSIP contacts. Warns if zero and Asterisk is running.
 	- **Asterisk AstDB call forward (CF)**: Warns for each extension that has `CF` enabled and flags circular call forward chains as problems.
 	- **Asterisk queue ring strategy**: Warns if more than 3 queues use `ringall`, or if any `ringall` queue has more than 5 agents.

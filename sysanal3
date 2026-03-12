@@ -383,6 +383,25 @@ check_nethvoice_localnets() {
     fi
 }
 
+check_nethvoice_email_from_address() {
+    local nv_mod="$1"
+    local smtp_from voicemail_mailcmd
+
+    smtp_from=$(runagent -m "$nv_mod" podman exec freepbx sh -c 'printenv SMTP_FROM_ADDRESS' 2>/dev/null || true)
+    smtp_from=$(echo "$smtp_from" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+
+    voicemail_mailcmd=$(runagent -m "$nv_mod" podman exec freepbx \
+        sh -c "grep -E '^[[:space:]]*mailcmd[[:space:]]*=' /etc/asterisk/voicemail.conf 2>/dev/null | grep -F -- 'send_email -f '" \
+        2>/dev/null || true)
+    voicemail_mailcmd=$(echo "$voicemail_mailcmd" | head -n1 | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+
+    if [[ -n "$smtp_from" || -n "$voicemail_mailcmd" ]]; then
+        ok "${nv_mod}: email from address configured"
+    else
+        warning "${nv_mod}: no email from address configured in freepbx (SMTP_FROM_ADDRESS or voicemail.conf mailcmd -f)"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Configurable constants
 # ---------------------------------------------------------------------------
@@ -465,6 +484,16 @@ info "Root filesystem: ${_rootfs:-N/A}"
 _root_pct=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}')
 if [[ -n "$_root_pct" && "$_root_pct" -ge 90 ]]; then
     problem "Root filesystem usage at ${_root_pct}% (>= 90%)"
+fi
+
+# /home filesystem usage (only if /home is a separate mount)
+if [[ "$(findmnt -n -o TARGET --target /home 2>/dev/null)" == "/home" ]]; then
+    _homefs=$(df -h /home 2>/dev/null | awk 'NR==2{printf "%s used / %s total (%s full)", $3, $2, $5}')
+    info "/home filesystem: ${_homefs:-N/A}"
+    _home_pct=$(df /home 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}')
+    if [[ -n "$_home_pct" && "$_home_pct" -ge 90 ]]; then
+        problem "/home filesystem usage at ${_home_pct}% (>= 90%)"
+    fi
 fi
 
 # CPU load average
@@ -762,6 +791,9 @@ if [[ -n "$nethvoice_modules" ]]; then
 
         # --- localnets in asterisk.kvstore_Sipsettings ---
         check_nethvoice_localnets "$nv_mod"
+
+        # --- FreePBX email from address ---
+        check_nethvoice_email_from_address "$nv_mod"
 
         # --- Asterisk PJSIP contacts ---
         pjsip_out=$(runagent -m "$nv_mod" podman exec freepbx asterisk -rx 'pjsip show contacts' 2>/dev/null || true)
