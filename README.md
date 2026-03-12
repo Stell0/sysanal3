@@ -28,6 +28,7 @@ It exits with code `1` if any problem is found, otherwise `0`.
 - **NethVoice-specific checks**:
   - DNS resolution via `getent hosts ibm.com`.
   - MySQL integrity via `mysqlcheck`.
+  - MariaDB `asterisk.kvstore_Sipsettings` `localnets` check (problem if a `localnets` row exists).
   - Asterisk PJSIP contacts count (warns if zero while Asterisk is running).
   - AstDB call forward check (warns for each extension with `CF` enabled and flags circular forwarding chains as problems).
   - Asterisk queue ring strategy check (warns if more than 3 queues use `ringall`, or any `ringall` queue has more than 5 agents).

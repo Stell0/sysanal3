@@ -41,6 +41,7 @@ It exits with code `1` if problems are found, otherwise `0`.
 - For all NethVoice modules:
 	- Check DNS by running `getent hosts ibm.com`.
 	- Run `mysqlcheck`.
+	- **MariaDB `asterisk.kvstore_Sipsettings` localnets**: Flags a problem if a `localnets` row exists.
 	- **Asterisk PJSIP contacts**: Counts registered PJSIP contacts. Warns if zero and Asterisk is running.
 	- **Asterisk AstDB call forward (CF)**: Warns for each extension that has `CF` enabled and flags circular call forward chains as problems.
 	- **Asterisk queue ring strategy**: Warns if more than 3 queues use `ringall`, or if any `ringall` queue has more than 5 agents.

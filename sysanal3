@@ -356,6 +356,33 @@ get_env_numeric_var() {
     grep -oP "^${var_name}=\K[0-9]+$" "$env_file" 2>/dev/null | head -1
 }
 
+check_nethvoice_localnets() {
+    local nv_mod="$1"
+    local localnets_out localnets_rc
+
+    localnets_out=$(runagent -m "$nv_mod" podman exec mariadb \
+        sh -c 'mysql -uroot -p${MARIADB_ROOT_PASSWORD} -N -B asterisk -e "SELECT \`key\`, val, type, id FROM kvstore_Sipsettings WHERE \`key\` = '\''localnets'\'';"' 2>&1)
+    localnets_rc=$?
+
+    if [[ "$localnets_rc" -ne 0 ]]; then
+        warning "${nv_mod}: could not query asterisk.kvstore_Sipsettings for localnets"
+        while read -r line; do
+            [[ -n "$line" ]] && echo "  ${line}"
+        done <<< "$localnets_out"
+        return
+    fi
+
+    if [[ -n "$localnets_out" ]]; then
+        problem "${nv_mod}: localnets configured in FreePBX. Localnets should be configured in the proxy"
+        while IFS=$'\t' read -r row_key row_val row_type row_id; do
+            [[ -z "$row_key" ]] && continue
+            echo "  key=${row_key} type=${row_type:-N/A} id=${row_id:-N/A} val=${row_val:-}"
+        done <<< "$localnets_out"
+    else
+        ok "${nv_mod}: asterisk.kvstore_Sipsettings has no localnets entry"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Configurable constants
 # ---------------------------------------------------------------------------
@@ -732,6 +759,9 @@ if [[ -n "$nethvoice_modules" ]]; then
         else
             ok "${nv_mod}: mysqlcheck OK"
         fi
+
+        # --- localnets in asterisk.kvstore_Sipsettings ---
+        check_nethvoice_localnets "$nv_mod"
 
         # --- Asterisk PJSIP contacts ---
         pjsip_out=$(runagent -m "$nv_mod" podman exec freepbx asterisk -rx 'pjsip show contacts' 2>/dev/null || true)
