@@ -137,27 +137,55 @@ is_port_listening_by_process() {
 }
 
 probe_hairpin_udp_sip() {
-    local public_ip="$1" port="$2"
-    local payload response branch tag call_id
+    local public_ip="$1"
+    local port="$2"
+    local local_ip branch tag call_id payload response
+
+    [[ "$public_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || {
+        echo "invalid public IP: $public_ip" >&2
+        return 2
+    }
+
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || {
+        echo "invalid port: $port" >&2
+        return 2
+    }
+
+    local_ip="$(ip route get "$public_ip" 2>/dev/null | awk '
+        {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "src") {
+                    print $(i+1)
+                    exit
+                }
+            }
+        }'
+    )"
+
+    [[ -n "$local_ip" ]] || {
+        echo "cannot determine local source IP for $public_ip" >&2
+        return 2
+    }
 
     branch="z9hG4bK-sysanal3-$$-$RANDOM"
     tag="sysanal3-$RANDOM"
-    call_id="sysanal3-$RANDOM-$$"
+    call_id="sysanal3-$RANDOM-$$@$local_ip"
+
     payload=$(
-        printf 'OPTIONS sip:%s SIP/2.0\r\n' "$public_ip"
-        printf 'Via: SIP/2.0/UDP %s;branch=%s\r\n' "$public_ip" "$branch"
-        printf 'From: <sip:sysanal3@%s>;tag=%s\r\n' "$public_ip" "$tag"
-        printf 'To: <sip:sysanal3@%s>\r\n' "$public_ip"
+        printf 'OPTIONS sip:sysanal3@%s:%s SIP/2.0\r\n' "$public_ip" "$port"
+        printf 'Via: SIP/2.0/UDP %s;rport;branch=%s\r\n' "$local_ip" "$branch"
+        printf 'Max-Forwards: 70\r\n'
+        printf 'From: <sip:sysanal3@%s>;tag=%s\r\n' "$local_ip" "$tag"
+        printf 'To: <sip:sysanal3@%s:%s>\r\n' "$public_ip" "$port"
         printf 'Call-ID: %s\r\n' "$call_id"
         printf 'CSeq: 1 OPTIONS\r\n'
-        printf 'Contact: <sip:sysanal3@%s>\r\n' "$public_ip"
-        printf 'Max-Forwards: 70\r\n'
-        printf 'Content-Length: 0\r\n\r\n'
+        printf 'Contact: <sip:sysanal3@%s>\r\n' "$local_ip"
+        printf 'Content-Length: 0\r\n'
     )
 
-    if ! exec 3<>"/dev/udp/${public_ip}/${port}" 2>/dev/null; then
-        return 2
-    fi
+    printf '%s\n' "$payload" > /dev/null
+
+    exec 3<>"/dev/udp/$public_ip/$port" 2>/dev/null || return 3
 
     printf '%s' "$payload" >&3 || {
         exec 3>&-
@@ -165,22 +193,17 @@ probe_hairpin_udp_sip() {
         return 1
     }
 
-    response=""
-    if ! IFS= read -r -t 4 response <&3; then
+    # Read one UDP datagram, not a "line"
+    if ! response="$(timeout 4 dd bs=65535 count=1 status=none <&3 2>/dev/null)"; then
         exec 3>&-
         exec 3<&-
         return 1
     fi
-
+ 
     exec 3>&-
     exec 3<&-
-
-    if echo "$response" | grep -qE '^SIP/2\.0 [0-9]{3}'; then
-        return 0
-    fi
-
-    return 1
 }
+
 
 probe_hairpin_tcp_tls() {
     local public_ip="$1" port="$2"
@@ -285,7 +308,7 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-echo -e "${BOLD}sysanal3 - NethServer 8 System Analyzer${NC}"
+echo -e "${BOLD}sysanal3 - NethServer 8 System Analyzer V3${NC}"
 echo "========================================="
 echo "Date: $(date)"
 
