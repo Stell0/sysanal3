@@ -136,10 +136,12 @@ is_port_listening_by_process() {
     [[ -n "$processes" ]] && echo " ${processes} " | grep -qiE "$expected_regex"
 }
 
-probe_hairpin_udp_sip() {
+probe_hairpin_sip() {
     local public_ip="$1"
     local port="$2"
-    local local_ip branch tag call_id payload response
+    local protocol="$3"
+
+    local local_ip branch tag call_id payload response contact_proto=""
 
     [[ "$public_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || {
         echo "invalid public IP: $public_ip" >&2
@@ -171,21 +173,28 @@ probe_hairpin_udp_sip() {
     tag="sysanal3-$RANDOM"
     call_id="sysanal3-$RANDOM-$$@$local_ip"
 
+    if [[ "$protocol" == "tcp" ]]; then
+        contact_proto=";transport=tcp"
+    elif [[ "$protocol" != "udp" ]]; then
+        echo "invalid protocol: $protocol" >&2
+        return 2
+    fi
+
     payload=$(
         printf 'OPTIONS sip:sysanal3@%s:%s SIP/2.0\r\n' "$public_ip" "$port"
-        printf 'Via: SIP/2.0/UDP %s;rport;branch=%s\r\n' "$local_ip" "$branch"
+        printf 'Via: SIP/2.0/%s %s;rport;branch=%s\r\n' "$(printf '%s\n' "$protocol" | tr '[:lower:]' '[:upper:]')" "$local_ip" "$branch"
         printf 'Max-Forwards: 70\r\n'
         printf 'From: <sip:sysanal3@%s>;tag=%s\r\n' "$local_ip" "$tag"
         printf 'To: <sip:sysanal3@%s:%s>\r\n' "$public_ip" "$port"
         printf 'Call-ID: %s\r\n' "$call_id"
         printf 'CSeq: 1 OPTIONS\r\n'
-        printf 'Contact: <sip:sysanal3@%s>\r\n' "$local_ip"
+        printf 'Contact: <sip:sysanal3@%s%s>\r\n' "$local_ip" "$contact_proto"
         printf 'Content-Length: 0\r\n'
     )
 
     printf '%s\n' "$payload" > /dev/null
 
-    exec 3<>"/dev/udp/$public_ip/$port" 2>/dev/null || return 3
+    exec 3<>"/dev/$(printf '%s\n' "$protocol" | tr '[:upper:]' '[:lower:]')/$public_ip/$port" 2>/dev/null || return 3
 
     printf '%s' "$payload" >&3 || {
         exec 3>&-
@@ -204,6 +213,62 @@ probe_hairpin_udp_sip() {
     exec 3<&-
 }
 
+probe_hairpin_udp_by_local_listener() {
+    local public_ip="$1"
+    local port="$2"
+
+    [[ "$public_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 2
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || return 2
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        return 2
+    fi
+
+    timeout 8 python3 - "$public_ip" "$port" <<'PY' >/dev/null 2>&1
+import os
+import random
+import socket
+import sys
+import time
+
+public_ip = sys.argv[1]
+port = int(sys.argv[2])
+deadline = time.time() + 6
+payload = f"sysanal3-hairpin-{port}-{os.getpid()}-{random.randint(0, 999999)}".encode()
+
+listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+if hasattr(socket, "SO_REUSEPORT"):
+    try:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except OSError:
+        pass
+
+try:
+    listener.bind(("", port))
+except OSError:
+    sys.exit(3)
+
+listener.settimeout(max(0.1, deadline - time.time()))
+
+sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    sender.sendto(payload, (public_ip, port))
+except OSError:
+    sys.exit(3)
+
+while time.time() < deadline:
+    try:
+        data, _addr = listener.recvfrom(65535)
+    except socket.timeout:
+        break
+    if payload in data:
+        sys.exit(0)
+    listener.settimeout(max(0.1, deadline - time.time()))
+
+sys.exit(1)
+PY
+}
 
 probe_hairpin_tcp_tls() {
     local public_ip="$1" port="$2"
@@ -244,12 +309,20 @@ check_hairpin_nat_for_nethvoice() {
 
         case "$port" in
             5060)
-                if probe_hairpin_udp_sip "$PUBLIC_IP" "$port"; then
+                if probe_hairpin_sip "$PUBLIC_IP" "$port" "udp"; then
                     ok "${nv_mod}: hairpin NAT works for SIP/UDP port ${port} via ${PUBLIC_IP}"
                 else
                     case $? in
                         2) info "${nv_mod}: hairpin NAT check skipped for SIP/UDP port ${port}: /dev/udp is not available" ;;
                         *) problem "${nv_mod}: hairpin NAT failed for SIP/UDP port ${port} via ${PUBLIC_IP}" ;;
+                    esac
+                fi
+                if probe_hairpin_sip "$PUBLIC_IP" "$port" "tcp"; then
+                    ok "${nv_mod}: hairpin NAT works for SIP/TCP port ${port} via ${PUBLIC_IP}"
+                else
+                    case $? in
+                        2) info "${nv_mod}: hairpin NAT check skipped for SIP/TCP port ${port}: /dev/tcp is not available" ;;
+                        *) problem "${nv_mod}: hairpin NAT failed for SIP/TCP port ${port} via ${PUBLIC_IP}" ;;
                     esac
                 fi
                 ;;
@@ -264,11 +337,14 @@ check_hairpin_nat_for_nethvoice() {
                 fi
                 ;;
             10001)
-                if is_port_listening_by_process "$port" "$expected_regex"; then
-                    warning "${nv_mod}: hairpin NAT check for UDP port ${port} is inconclusive: kamailio is listening on ${PUBLIC_IP}:${port}, but no deterministic reply-based probe is available"
+                if probe_hairpin_udp_by_local_listener "$PUBLIC_IP" "$port"; then
+                    ok "${nv_mod}: hairpin NAT works for UDP port ${port} via ${PUBLIC_IP}"
                 else
-                    processes=$(get_listener_processes_by_port "$port")
-                    warning "${nv_mod}: hairpin NAT check for UDP port ${port} is inconclusive: no kamailio listener was found locally (found: ${processes:-none}), and no deterministic reply-based probe is available"
+                    case $? in
+                        2) info "${nv_mod}: hairpin NAT check skipped for UDP port ${port}: Python 3 is not available" ;;
+                        3) problem "${nv_mod}: hairpin NAT check for UDP port ${port} could not start a local listener on port ${port}" ;;
+                        *) problem "${nv_mod}: hairpin NAT failed for UDP port ${port} via ${PUBLIC_IP}" ;;
+                    esac
                 fi
                 ;;
         esac
