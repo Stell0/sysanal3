@@ -30,6 +30,7 @@ It exits with code `1` if any problem is found, otherwise `0`.
   - MySQL integrity via `mysqlcheck`.
   - MariaDB `asterisk.kvstore_Sipsettings` `localnets` check (problem if a `localnets` row exists).
   - FreePBX email sender check (warns if neither `SMTP_FROM_ADDRESS` nor `voicemail.conf` `mailcmd=...send_email -f ...` is configured).
+  - Collects domain-to-URI routes from local `nethvoice-proxy` modules and verifies that each instance `NETHVOICE_HOST` points to `sip:<wg0 IPv4>:<ASTERISK_SIP_PORT>`.
   - Asterisk PJSIP contacts count (warns if zero while Asterisk is running).
   - AstDB call forward check (warns for each extension with `CF` enabled and flags circular forwarding chains as problems).
   - Asterisk queue ring strategy check (warns if more than 3 queues use `ringall`, or any `ringall` queue has more than 5 agents).

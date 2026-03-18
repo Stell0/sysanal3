@@ -23,6 +23,8 @@ WARNINGS=0
 declare -a PROBLEM_MSGS=()
 declare -a WARNING_MSGS=()
 declare -a LOCAL_IPS_ARRAY=()
+declare -A NETHVOICE_PROXY_DOMAIN_URI_MAP=()
+declare -A NETHVOICE_PROXY_DOMAIN_SOURCE_MAP=()
 
 problem() { echo -e "${RED}[PROBLEM]${NC} $*"; PROBLEM_MSGS+=("$*"); ((PROBLEMS++)); }
 warning() { echo -e "${YELLOW}[WARNING]${NC} $*"; WARNING_MSGS+=("$*"); ((WARNINGS++)); }
@@ -32,6 +34,9 @@ header()  { echo ""; echo -e "${BOLD}=== $* ===${NC}"; }
 
 LOCAL_IPS_DISPLAY="N/A"
 PUBLIC_IP=""
+LOCAL_VPN_ADDRESS=""
+NETHVOICE_PROXY_MODULE_COUNT=0
+NETHVOICE_PROXY_ROUTE_COUNT=0
 
 get_listener_lines_by_port() {
     local port="$1"
@@ -354,6 +359,127 @@ check_hairpin_nat_for_nethvoice() {
 get_env_numeric_var() {
     local env_file="$1" var_name="$2"
     grep -oP "^${var_name}=\K[0-9]+$" "$env_file" 2>/dev/null | head -1
+}
+
+get_env_var() {
+    local env_file="$1" var_name="$2"
+    grep -oP "^${var_name}=\K.*" "$env_file" 2>/dev/null | head -1
+}
+
+collect_nethvoice_proxy_domain_uris() {
+    local proxy_modules proxy_mod proxy_out proxy_rc domain uri existing_uri existing_source
+
+    NETHVOICE_PROXY_DOMAIN_URI_MAP=()
+    NETHVOICE_PROXY_DOMAIN_SOURCE_MAP=()
+    NETHVOICE_PROXY_MODULE_COUNT=0
+    NETHVOICE_PROXY_ROUTE_COUNT=0
+
+    proxy_modules=$(echo "$MODULES_ON_NODE" | awk -F'|' '$4 == "nethvoice-proxy" {print $1}' || true)
+    if [[ -z "$proxy_modules" ]]; then
+        info "No nethvoice-proxy modules found on this node"
+        return
+    fi
+
+    while read -r proxy_mod; do
+        [[ -z "$proxy_mod" ]] && continue
+        ((NETHVOICE_PROXY_MODULE_COUNT++))
+
+        proxy_out=$(runagent -m "$proxy_mod" podman exec -i postgres sh -lc "
+psql -U \"\$POSTGRES_USER\" \"\$POSTGRES_DB\" <<'SQL'
+COPY (
+  SELECT r.target AS domain, d.destination AS uri
+  FROM nethvoice_proxy_routes r
+  JOIN dispatcher d ON d.setid = r.setid
+  WHERE r.route_type = 'domain'
+  ORDER BY r.target, d.destination
+) TO STDOUT WITH CSV HEADER;
+SQL
+" 2>&1)
+        proxy_rc=$?
+
+        if [[ "$proxy_rc" -ne 0 ]]; then
+            warning "${proxy_mod}: could not retrieve domain routes from postgres"
+            while read -r line; do
+                [[ -n "$line" ]] && echo "  ${line}"
+            done <<< "$proxy_out"
+            continue
+        fi
+
+        while IFS=',' read -r domain uri; do
+            domain=$(echo "$domain" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+            uri=$(echo "$uri" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+
+            [[ -z "$domain" || "$domain" == "domain" ]] && continue
+            [[ -z "$uri" ]] && continue
+
+            if [[ -n "${NETHVOICE_PROXY_DOMAIN_URI_MAP[$domain]+x}" ]]; then
+                existing_uri="${NETHVOICE_PROXY_DOMAIN_URI_MAP[$domain]}"
+                existing_source="${NETHVOICE_PROXY_DOMAIN_SOURCE_MAP[$domain]}"
+                if [[ "$existing_uri" != "$uri" ]]; then
+                    problem "${proxy_mod}: conflicting proxy URI for domain ${domain} (existing: ${existing_uri} from ${existing_source}, found: ${uri})"
+                    continue
+                fi
+                continue
+            fi
+
+            NETHVOICE_PROXY_DOMAIN_URI_MAP["$domain"]="$uri"
+            NETHVOICE_PROXY_DOMAIN_SOURCE_MAP["$domain"]="$proxy_mod"
+            ((NETHVOICE_PROXY_ROUTE_COUNT++))
+        done <<< "$proxy_out"
+    done <<< "$proxy_modules"
+
+    if [[ "$NETHVOICE_PROXY_ROUTE_COUNT" -gt 0 ]]; then
+        info "Collected ${NETHVOICE_PROXY_ROUTE_COUNT} NethVoice domain route(s) from ${NETHVOICE_PROXY_MODULE_COUNT} nethvoice-proxy module(s)"
+    elif [[ "$NETHVOICE_PROXY_MODULE_COUNT" -gt 0 ]]; then
+        warning "No NethVoice domain routes found in local nethvoice-proxy modules"
+    fi
+}
+
+check_nethvoice_proxy_domain_uri() {
+    local nv_mod="$1" nv_env_file="$2"
+    local nethvoice_host expected_sip_port expected_uri actual_uri proxy_source
+
+    if [[ ! -f "$nv_env_file" ]]; then
+        warning "${nv_mod}: cannot read environment file (${nv_env_file}) for proxy domain URI validation"
+        return
+    fi
+
+    nethvoice_host=$(get_env_var "$nv_env_file" "NETHVOICE_HOST")
+    if [[ -z "$nethvoice_host" ]]; then
+        warning "${nv_mod}: NETHVOICE_HOST is not set; proxy domain URI validation skipped"
+        return
+    fi
+
+    expected_sip_port=$(get_env_numeric_var "$nv_env_file" "ASTERISK_SIP_PORT")
+    if [[ -z "$expected_sip_port" ]]; then
+        warning "${nv_mod}: ASTERISK_SIP_PORT is not set; proxy domain URI validation skipped"
+        return
+    fi
+
+    if [[ -z "$LOCAL_VPN_ADDRESS" ]]; then
+        warning "${nv_mod}: cannot determine LOCAL_VPN_ADDRESS from wg0; proxy domain URI validation skipped"
+        return
+    fi
+
+    if [[ "$NETHVOICE_PROXY_ROUTE_COUNT" -eq 0 ]]; then
+        info "${nv_mod}: proxy domain URI validation skipped: no nethvoice-proxy routes available"
+        return
+    fi
+
+    if [[ -z "${NETHVOICE_PROXY_DOMAIN_URI_MAP[$nethvoice_host]+x}" ]]; then
+        problem "${nv_mod}: no nethvoice-proxy route found for NETHVOICE_HOST=${nethvoice_host}"
+        return
+    fi
+
+    expected_uri="sip:${LOCAL_VPN_ADDRESS}:${expected_sip_port}"
+    actual_uri="${NETHVOICE_PROXY_DOMAIN_URI_MAP[$nethvoice_host]}"
+    proxy_source="${NETHVOICE_PROXY_DOMAIN_SOURCE_MAP[$nethvoice_host]}"
+
+    if [[ "$actual_uri" == "$expected_uri" ]]; then
+        ok "${nv_mod}: nethvoice-proxy route for ${nethvoice_host} matches ${expected_uri}${proxy_source:+ (source: ${proxy_source})}"
+    else
+        problem "${nv_mod}: nethvoice-proxy route for ${nethvoice_host} must be ${expected_uri}, found ${actual_uri}${proxy_source:+ (source: ${proxy_source})}"
+    fi
 }
 
 check_nethvoice_localnets() {
@@ -751,11 +877,15 @@ fi
 # ---------------------------------------------------------------------------
 header "Check: NethVoice modules"
 
+LOCAL_VPN_ADDRESS=$(ip -o -4 addr show dev wg0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true)
+collect_nethvoice_proxy_domain_uris
+
 # Match only "nethvoice" modules, not "nethvoice-proxy" or other nethvoice-* variants
 nethvoice_modules=$(echo "$MODULES_ON_NODE" | awk -F'|' '$4 == "nethvoice" {print $1}' || true)
 if [[ -n "$nethvoice_modules" ]]; then
     while read -r nv_mod; do
         info "Checking NethVoice module: ${nv_mod}"
+        nv_env_file="/home/${nv_mod}/.config/state/environment"
 
         # --- DNS resolution inside freepbx container ---
         dns_start=$(date +%s%N)
@@ -794,6 +924,9 @@ if [[ -n "$nethvoice_modules" ]]; then
 
         # --- FreePBX email from address ---
         check_nethvoice_email_from_address "$nv_mod"
+
+        # --- nethvoice-proxy domain URI alignment ---
+        check_nethvoice_proxy_domain_uri "$nv_mod" "$nv_env_file"
 
         # --- Asterisk PJSIP contacts ---
         pjsip_out=$(runagent -m "$nv_mod" podman exec freepbx asterisk -rx 'pjsip show contacts' 2>/dev/null || true)
@@ -991,7 +1124,6 @@ if [[ -n "$nethvoice_modules" ]]; then
         fi
 
         # --- Port variables and service ownership checks ---
-        nv_env_file="/home/${nv_mod}/.config/state/environment"
         if [[ ! -f "$nv_env_file" ]]; then
             warning "${nv_mod}: cannot read environment file (${nv_env_file}) for port checks"
             continue
