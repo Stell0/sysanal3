@@ -285,6 +285,102 @@ probe_hairpin_tcp_tls() {
     timeout 6 openssl s_client -connect "${public_ip}:${port}" -brief </dev/null >/dev/null 2>&1
 }
 
+probe_tls_certificate() {
+    local hostname="$1" port="$2"
+    local openssl_out cert_file
+
+    if ! command -v openssl >/dev/null 2>&1; then
+        TLS_CERT_ERROR="openssl is not available"
+        return 2
+    fi
+
+    if [[ -z "$hostname" || -z "$port" ]]; then
+        TLS_CERT_ERROR="hostname or port is empty"
+        return 7
+    fi
+
+    cert_file=$(mktemp)
+    if [[ -z "$cert_file" || ! -f "$cert_file" ]]; then
+        TLS_CERT_ERROR="could not create temporary file"
+        return 7
+    fi
+
+    openssl_out=$(timeout 8 openssl s_client -connect "${hostname}:${port}" -servername "$hostname" -showcerts </dev/null 2>&1)
+    if [[ $? -ne 0 ]]; then
+        rm -f "$cert_file"
+        TLS_CERT_ERROR=$(echo "$openssl_out" | awk 'NF { line=$0 } END { print line }')
+        TLS_CERT_ERROR=${TLS_CERT_ERROR:-connection failed}
+        return 3
+    fi
+
+    if ! echo "$openssl_out" | awk '
+        /-----BEGIN CERTIFICATE-----/ {
+            capture = 1
+        }
+        capture {
+            print
+        }
+        /-----END CERTIFICATE-----/ {
+            exit
+        }
+    ' > "$cert_file"; then
+        rm -f "$cert_file"
+        TLS_CERT_ERROR="could not extract peer certificate"
+        return 4
+    fi
+
+    if [[ ! -s "$cert_file" ]]; then
+        rm -f "$cert_file"
+        TLS_CERT_ERROR="peer did not provide a certificate"
+        return 4
+    fi
+
+    if ! openssl x509 -in "$cert_file" -noout >/dev/null 2>&1; then
+        rm -f "$cert_file"
+        TLS_CERT_ERROR="peer certificate is not valid X.509 data"
+        return 4
+    fi
+
+    if ! openssl x509 -in "$cert_file" -noout -checkhost "$hostname" >/dev/null 2>&1; then
+        rm -f "$cert_file"
+        TLS_CERT_ERROR="certificate does not match hostname ${hostname}"
+        return 5
+    fi
+
+    if ! openssl x509 -in "$cert_file" -noout -checkend 0 >/dev/null 2>&1; then
+        rm -f "$cert_file"
+        TLS_CERT_ERROR="certificate is expired"
+        return 6
+    fi
+
+    rm -f "$cert_file"
+    TLS_CERT_ERROR=""
+    return 0
+}
+
+check_tls_certificate_endpoint() {
+    local label="$1" hostname="$2" port="$3"
+
+    if probe_tls_certificate "$hostname" "$port"; then
+        ok "${label}: certificate is valid for ${hostname}:${port}"
+        return 0
+    fi
+
+    case $? in
+        2)
+            info "${label}: certificate check skipped for ${hostname}:${port}: ${TLS_CERT_ERROR}"
+            ;;
+        3|4|5|6)
+            problem "${label}: certificate check failed for ${hostname}:${port}: ${TLS_CERT_ERROR}"
+            ;;
+        *)
+            warning "${label}: certificate check skipped for ${hostname}:${port}: ${TLS_CERT_ERROR}"
+            ;;
+    esac
+
+    return 1
+}
+
 check_hairpin_nat_for_nethvoice() {
     local nv_mod="$1"
     local port processes
@@ -879,6 +975,30 @@ header "Check: NethVoice modules"
 
 LOCAL_VPN_ADDRESS=$(ip -o -4 addr show dev wg0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true)
 collect_nethvoice_proxy_domain_uris
+proxy_modules=$(echo "$MODULES_ON_NODE" | awk -F'|' '$4 == "nethvoice-proxy" {print $1}' || true)
+
+if [[ -n "$proxy_modules" ]]; then
+    while read -r proxy_mod; do
+        [[ -z "$proxy_mod" ]] && continue
+        proxy_env_file="/home/${proxy_mod}/.config/state/environment"
+
+        if [[ ! -f "$proxy_env_file" ]]; then
+            warning "${proxy_mod}: cannot read environment file (${proxy_env_file}) for certificate checks"
+            continue
+        fi
+
+        kml_default_fqdn=$(get_env_var "$proxy_env_file" "KML_DEFAULT_FQDN")
+        if [[ -z "$kml_default_fqdn" ]]; then
+            warning "${proxy_mod}: KML_DEFAULT_FQDN is not set; certificate checks skipped"
+            continue
+        fi
+
+        check_tls_certificate_endpoint "${proxy_mod} KML_DEFAULT_FQDN HTTPS" "$kml_default_fqdn" 443
+        check_tls_certificate_endpoint "${proxy_mod} KML_DEFAULT_FQDN SIP/TLS" "$kml_default_fqdn" 5061
+    done <<< "$proxy_modules"
+else
+    info "No nethvoice-proxy modules found for KML_DEFAULT_FQDN certificate checks"
+fi
 
 # Match only "nethvoice" modules, not "nethvoice-proxy" or other nethvoice-* variants
 nethvoice_modules=$(echo "$MODULES_ON_NODE" | awk -F'|' '$4 == "nethvoice" {print $1}' || true)
@@ -927,6 +1047,18 @@ if [[ -n "$nethvoice_modules" ]]; then
 
         # --- nethvoice-proxy domain URI alignment ---
         check_nethvoice_proxy_domain_uri "$nv_mod" "$nv_env_file"
+
+        # --- public certificate checks ---
+        if [[ ! -f "$nv_env_file" ]]; then
+            warning "${nv_mod}: cannot read environment file (${nv_env_file}) for certificate checks"
+        else
+            nethvoice_host=$(get_env_var "$nv_env_file" "NETHVOICE_HOST")
+            if [[ -z "$nethvoice_host" ]]; then
+                warning "${nv_mod}: NETHVOICE_HOST is not set; certificate check skipped"
+            else
+                check_tls_certificate_endpoint "${nv_mod} NETHVOICE_HOST HTTPS" "$nethvoice_host" 443
+            fi
+        fi
 
         # --- Asterisk PJSIP contacts ---
         pjsip_out=$(runagent -m "$nv_mod" podman exec freepbx asterisk -rx 'pjsip show contacts' 2>/dev/null || true)

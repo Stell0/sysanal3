@@ -30,7 +30,9 @@ It exits with code `1` if any problem is found, otherwise `0`.
   - MySQL integrity via `mysqlcheck`.
   - MariaDB `asterisk.kvstore_Sipsettings` `localnets` check (problem if a `localnets` row exists).
   - FreePBX email sender check (warns if neither `SMTP_FROM_ADDRESS` nor `voicemail.conf` `mailcmd=...send_email -f ...` is configured).
+  - Validates the certificate presented by each local `nethvoice-proxy` `KML_DEFAULT_FQDN` on ports `443` and `5061` (TLS handshake, hostname match, non-expired certificate).
   - Collects domain-to-URI routes from local `nethvoice-proxy` modules and verifies that each instance `NETHVOICE_HOST` points to `sip:<wg0 IPv4>:<ASTERISK_SIP_PORT>`.
+  - Validates the certificate presented by each instance `NETHVOICE_HOST` on port `443` (TLS handshake, hostname match, non-expired certificate).
   - Asterisk PJSIP contacts count (warns if zero while Asterisk is running).
   - AstDB call forward check (warns for each extension with `CF` enabled and flags circular forwarding chains as problems).
   - Asterisk queue ring strategy check (warns if more than 3 queues use `ringall`, or any `ringall` queue has more than 5 agents).
@@ -38,6 +40,8 @@ It exits with code `1` if any problem is found, otherwise `0`.
   - Verifies Asterisk expected listening ports, enforces that Asterisk is not listening on `5060`/`5061`, and checks PJSIP transport port alignment.
 - **Listening ports** — Verifies expected ports are in LISTEN state for installed services (Traefik 80/443, Samba 389/636, Mail 25/143/993) and checks NethVoice SIP/SIPS ports from module environment (`PROXY_PORT`, `ASTERISK_SIP_PORT`, `ASTERISK_SIPS_PORT`) with process-owner validation.
 - **CrowdSec** — If present, checks whether any local IP is blocked.
+
+The certificate checks require `openssl` to be available on the host. If `openssl` is missing, the script reports that the related certificate checks were skipped.
 
 ## Arguments
 
