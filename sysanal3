@@ -643,11 +643,11 @@ IFS="
 for pattern in $patterns; do
     [ -n "$pattern" ] || continue
 
-    match=$(grep -F -i -m 1 -- "$pattern" /var/log/asterisk/full 2>/dev/null || true)
+    match=$(grep -E -i -m 1 -- "$pattern" /var/log/asterisk/full 2>/dev/null || true)
     if [ -z "$match" ]; then
         for file in /var/log/asterisk/full.*.gz; do
             [ -e "$file" ] || continue
-            match=$(gzip -cd -- "$file" 2>/dev/null | grep -F -i -m 1 -- "$pattern" || true)
+            match=$(gzip -cd -- "$file" 2>/dev/null | grep -E -i -m 1 -- "$pattern" || true)
             [ -n "$match" ] && break
         done
     fi
@@ -676,6 +676,45 @@ exit "$status"
     fi
 }
 
+check_system_messages_log() {
+    local log_scan_out log_scan_rc match_tag pattern matched_line
+
+    if [[ ! -f /var/log/messages ]]; then
+        warning "/var/log/messages does not exist"
+        return
+    fi
+
+    log_scan_out=$(
+        patterns="$MESSAGES_LOG_ERROR_PATTERNS"
+        status=1
+
+        while IFS= read -r pattern; do
+            [[ -n "$pattern" ]] || continue
+
+            matched_line=$(grep -E -i -m 1 -- "$pattern" /var/log/messages 2>/dev/null || true)
+            if [[ -n "$matched_line" ]]; then
+                printf 'MATCH\t%s\t%s\n' "$pattern" "$matched_line"
+                status=0
+            fi
+        done <<< "$patterns"
+
+        exit "$status"
+    )
+    log_scan_rc=$?
+
+    if [[ "$log_scan_rc" -eq 0 && -n "$log_scan_out" ]]; then
+        while IFS=$'\t' read -r match_tag pattern matched_line; do
+            [[ "$match_tag" != "MATCH" || -z "$pattern" ]] && continue
+            problem "/var/log/messages contains common error pattern: ${pattern}"
+            [[ -n "$matched_line" ]] && echo "  ${matched_line}"
+        done <<< "$log_scan_out"
+    elif [[ "$log_scan_rc" -eq 1 ]]; then
+        ok "No common error found in /var/log/messages"
+    else
+        warning "Could not scan /var/log/messages for common errors"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Configurable constants
 # ---------------------------------------------------------------------------
@@ -684,10 +723,52 @@ Too many open files
 Cannot create socket
 Channel allocation failed
 Unable to create channel
+Unable to create channel of type
 we couldn't allocate a port for RTP instance
+No RTP engine was found
+failed to setup RTP instance
+RTP no remote address on instance
 Unable to allocate RTP socket
 Failed to create a new socket for RTP instance
 Unable to create RTP instance using RTP engine
+Couldn't negotiate stream
+No translator path exists
+Failed to create srtp session
+SRTP (protect|unprotect)
+Is endpoint registered and reachable
+File .* does not exist in any format
+Unable to open .*format
+EOF
+)
+
+MESSAGES_LOG_ERROR_PATTERNS=$(cat <<'EOF'
+kernel panic
+panic not syncing
+(^|[^[:alnum:]_])BUG:
+Oops:
+general protection fault
+unable to handle kernel NULL pointer dereference
+segfault
+core dumped
+Out of memory:
+Killed process .*oom
+oom-kill
+Failed with result .*(oom-kill|signal|core-dump|timeout)
+soft lockup
+hard LOCKUP
+rcu.*stall
+blocked for more than
+I/O error
+Buffer I/O error
+blk_update_request: I/O error
+EXT4-fs error
+Remounting filesystem read-only
+XFS .*shutdown
+NETDEV WATCHDOG
+transmit queue timed out
+emergency mode
+No working init found
+FATAL:
 EOF
 )
 
@@ -832,6 +913,13 @@ if [[ -n "$sngrep_pids" ]]; then
 else
     ok "No sngrep instances found"
 fi
+
+# ---------------------------------------------------------------------------
+# 1b. Check /var/log/messages for common system errors
+# ---------------------------------------------------------------------------
+header "Check: /var/log/messages common errors"
+
+check_system_messages_log
 
 # ---------------------------------------------------------------------------
 # 2. List all modules on this node
