@@ -624,9 +624,73 @@ check_nethvoice_email_from_address() {
     fi
 }
 
+check_nethvoice_asterisk_full_logs() {
+    local nv_mod="$1"
+    local log_scan_out log_scan_rc match_tag pattern matched_line
+
+    if ! runagent -m "$nv_mod" podman exec freepbx test -f /var/log/asterisk/full 2>/dev/null; then
+        warning "${nv_mod}: /var/log/asterisk/full does not exist"
+        return
+    fi
+
+    log_scan_out=$(runagent -m "$nv_mod" podman exec freepbx sh -c '
+patterns="$1"
+status=1
+
+old_ifs=$IFS
+IFS="
+"
+for pattern in $patterns; do
+    [ -n "$pattern" ] || continue
+
+    match=$(grep -F -i -m 1 -- "$pattern" /var/log/asterisk/full 2>/dev/null || true)
+    if [ -z "$match" ]; then
+        for file in /var/log/asterisk/full.*.gz; do
+            [ -e "$file" ] || continue
+            match=$(gzip -cd -- "$file" 2>/dev/null | grep -F -i -m 1 -- "$pattern" || true)
+            [ -n "$match" ] && break
+        done
+    fi
+
+    if [ -n "$match" ]; then
+        printf "MATCH\t%s\t%s\n" "$pattern" "$match"
+        status=0
+    fi
+done
+IFS=$old_ifs
+
+exit "$status"
+' sh "$ASTERISK_FULL_LOG_ERROR_PATTERNS" 2>/dev/null)
+    log_scan_rc=$?
+
+    if [[ "$log_scan_rc" -eq 0 && -n "$log_scan_out" ]]; then
+        while IFS=$'\t' read -r match_tag pattern matched_line; do
+            [[ "$match_tag" != "MATCH" || -z "$pattern" ]] && continue
+            problem "${nv_mod}: Asterisk full log contains common error pattern: ${pattern}"
+            [[ -n "$matched_line" ]] && echo "  ${matched_line}"
+        done <<< "$log_scan_out"
+    elif [[ "$log_scan_rc" -eq 1 ]]; then
+        ok "${nv_mod}: No common error found in full log"
+    else
+        warning "${nv_mod}: could not scan /var/log/asterisk/full for common errors"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Configurable constants
 # ---------------------------------------------------------------------------
+ASTERISK_FULL_LOG_ERROR_PATTERNS=$(cat <<'EOF'
+Too many open files
+Cannot create socket
+Channel allocation failed
+Unable to create channel
+we couldn't allocate a port for RTP instance
+Unable to allocate RTP socket
+Failed to create a new socket for RTP instance
+Unable to create RTP instance using RTP engine
+EOF
+)
+
 RESTART_THRESHOLD=5            # Container restarts above this count flag a problem
 DNS_SLOW_MS=2000               # DNS resolution slower than this (ms) flags a problem
 QUEUE_RINGALL_MAX_QUEUES=3     # Warn if ringall strategy is used by more than this number of queues
@@ -1044,6 +1108,9 @@ if [[ -n "$nethvoice_modules" ]]; then
 
         # --- FreePBX email from address ---
         check_nethvoice_email_from_address "$nv_mod"
+
+        # --- Asterisk full log common errors ---
+        check_nethvoice_asterisk_full_logs "$nv_mod"
 
         # --- nethvoice-proxy domain URI alignment ---
         check_nethvoice_proxy_domain_uri "$nv_mod" "$nv_env_file"
