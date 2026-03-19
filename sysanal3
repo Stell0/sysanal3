@@ -28,8 +28,9 @@ declare -A NETHVOICE_PROXY_DOMAIN_SOURCE_MAP=()
 
 problem() { echo -e "${RED}[PROBLEM]${NC} $*"; PROBLEM_MSGS+=("$*"); ((PROBLEMS++)); }
 warning() { echo -e "${YELLOW}[WARNING]${NC} $*"; WARNING_MSGS+=("$*"); ((WARNINGS++)); }
-info()    { echo -e "${CYAN}[INFO]${NC} $*"; }
-ok()      { echo -e "${GREEN}[OK]${NC} $*"; }
+info()    { [[ ${SILENT:-0} -eq 1 ]] || echo -e "${CYAN}[INFO]${NC} $*"; }
+info_always() { echo -e "${CYAN}[INFO]${NC} $*"; }
+ok()      { [[ ${SILENT:-0} -eq 1 ]] || echo -e "${GREEN}[OK]${NC} $*"; }
 header()  { echo ""; echo -e "${BOLD}=== $* ===${NC}"; }
 
 LOCAL_IPS_DISPLAY="N/A"
@@ -722,7 +723,6 @@ ASTERISK_FULL_LOG_ERROR_PATTERNS=$(cat <<'EOF'
 Too many open files
 Cannot create socket
 Channel allocation failed
-Unable to create channel
 Unable to create channel of type
 we couldn't allocate a port for RTP instance
 No RTP engine was found
@@ -778,12 +778,14 @@ QUEUE_RINGALL_MAX_QUEUES=3     # Warn if ringall strategy is used by more than t
 QUEUE_RINGALL_MAX_AGENTS=5     # Warn if any ringall queue has more than this number of agents
 INTERNET_OK=1                  # Set to 0 if connectivity precheck fails
 IS_WORKER=0                    # Set to 1 when running via SSH on a worker node
+SILENT=0                       # Set to 1 to suppress OK and INFO messages
 
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -s|--silent) SILENT=1; shift ;;
         --worker) IS_WORKER=1; shift ;;
         *)        shift ;;
     esac
@@ -821,25 +823,25 @@ fi
 header "General System Data"
 
 # IP addresses
-info "IP addresses: ${LOCAL_IPS_DISPLAY}"
-info "Public IP: ${PUBLIC_IP:-unavailable}"
+info_always "IP addresses: ${LOCAL_IPS_DISPLAY}"
+info_always "Public IP: ${PUBLIC_IP:-unavailable}"
 if [[ -z "$PUBLIC_IP" ]]; then
     warning "Public IP could not be determined; hairpin NAT checks will be skipped"
 fi
 
 # DNS nameservers
 _nameservers=$(grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | xargs || true)
-info "DNS nameservers: ${_nameservers:-N/A}"
+info_always "DNS nameservers: ${_nameservers:-N/A}"
 
 # Hostname / FQDN
-info "Hostname: $(hostname -f 2>/dev/null || hostname 2>/dev/null || echo 'N/A')"
+info_always "Hostname: $(hostname -f 2>/dev/null || hostname 2>/dev/null || echo 'N/A')"
 
 # Open file descriptors
 _filenr=$(cat /proc/sys/fs/file-nr 2>/dev/null || true)
 if [[ -n "$_filenr" ]]; then
     _used=$(echo "$_filenr" | awk '{print $1}')
     _max=$(echo "$_filenr" | awk '{print $3}')
-    info "Open file descriptors: ${_used} / ${_max}"
+    info_always "Open file descriptors: ${_used} / ${_max}"
     if [[ "$_max" -gt 0 ]] && (( _used * 100 / _max >= 90 )); then
         problem "Open file descriptors at ${_used}/${_max} (>= 90%)"
     fi
@@ -847,7 +849,7 @@ fi
 
 # Root filesystem usage
 _rootfs=$(df -h / 2>/dev/null | awk 'NR==2{printf "%s used / %s total (%s full)", $3, $2, $5}')
-info "Root filesystem: ${_rootfs:-N/A}"
+info_always "Root filesystem: ${_rootfs:-N/A}"
 _root_pct=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}')
 if [[ -n "$_root_pct" && "$_root_pct" -ge 90 ]]; then
     problem "Root filesystem usage at ${_root_pct}% (>= 90%)"
@@ -856,7 +858,7 @@ fi
 # /home filesystem usage (only if /home is a separate mount)
 if [[ "$(findmnt -n -o TARGET --target /home 2>/dev/null)" == "/home" ]]; then
     _homefs=$(df -h /home 2>/dev/null | awk 'NR==2{printf "%s used / %s total (%s full)", $3, $2, $5}')
-    info "/home filesystem: ${_homefs:-N/A}"
+    info_always "/home filesystem: ${_homefs:-N/A}"
     _home_pct=$(df /home 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}')
     if [[ -n "$_home_pct" && "$_home_pct" -ge 90 ]]; then
         problem "/home filesystem usage at ${_home_pct}% (>= 90%)"
@@ -867,7 +869,7 @@ fi
 _cpu_cores=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || true)
 _load_avg_1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || true)
 if [[ -n "$_cpu_cores" && -n "$_load_avg_1" ]]; then
-    info "CPU load average (1m): ${_load_avg_1} on ${_cpu_cores} core(s)"
+    info_always "CPU load average (1m): ${_load_avg_1} on ${_cpu_cores} core(s)"
     if awk -v load_avg="$_load_avg_1" -v cores="$_cpu_cores" 'BEGIN { exit !(load_avg > (2 * cores)) }'; then
         problem "CPU load average is ${_load_avg_1} on ${_cpu_cores} core(s) (> 2x core count)"
     elif awk -v load_avg="$_load_avg_1" -v cores="$_cpu_cores" 'BEGIN { exit !(load_avg > cores) }'; then
@@ -876,23 +878,23 @@ if [[ -n "$_cpu_cores" && -n "$_load_avg_1" ]]; then
 fi
 
 # Uptime
-info "Uptime: $(uptime -p 2>/dev/null || uptime | sed 's/.*up/up/' || echo 'N/A')"
+info_always "Uptime: $(uptime -p 2>/dev/null || uptime | sed 's/.*up/up/' || echo 'N/A')"
 
 # Timezone
 _tz=$(timedatectl 2>/dev/null | grep -i 'time zone' | awk '{print $3, $4, $5}' || true)
-info "Timezone: ${_tz:-N/A}"
+info_always "Timezone: ${_tz:-N/A}"
 
 # Cluster subscription system_id
 _sub_id=$(redis-cli --raw hget cluster/subscription system_id 2>/dev/null || true)
 if [[ -z "$_sub_id" ]]; then
     warning "Cluster subscription system_id is empty or missing"
 else
-    info "Subscription system_id: ${_sub_id}"
+    info_always "Subscription system_id: ${_sub_id}"
 fi
 
 # Cluster UUID
 _cluster_uuid=$(redis-cli --raw get cluster/uuid 2>/dev/null || true)
-info "Cluster UUID: ${_cluster_uuid:-N/A}"
+info_always "Cluster UUID: ${_cluster_uuid:-N/A}"
 
 # ---------------------------------------------------------------------------
 # 1. Check for sngrep running > 1 day
@@ -988,7 +990,7 @@ if [[ -z "$MODULES" ]]; then
 else
     info "Modules on node ${NODE_ID}:"
     while IFS='|' read -r mod_id mod_source mod_version mod_name; do
-        echo "  - ${mod_id} (${mod_name}) version ${mod_version}"
+        info "  - ${mod_id} (${mod_name}) version ${mod_version}"
     done <<< "$MODULES_ON_NODE"
 fi
 
@@ -1059,7 +1061,7 @@ if [[ -n "$MODULES" ]]; then
         fi
         info "Containers for ${mod}:"
         while read -r cline; do
-            echo "  ${cline}"
+            info "  ${cline}"
             # Flag unhealthy states
             if echo "$cline" | grep -qiE '\[Status:(Created|Exited|Paused)'; then
                 warning "${mod}: container not running — ${cline%% \[*}"
@@ -1463,6 +1465,11 @@ if [[ -n "$nethvoice_modules" ]]; then
                 continue
             fi
 
+            if [[ "$nv_var" == "ASTERISK_IAX_PORT" ]]; then
+                info "${nv_mod}: ${nv_var}=${nv_port} skipped (IAX listener check disabled)"
+                continue
+            fi
+
             if [[ "$nv_var" == "ASTERISK_RECORDING_SFTP_PORT" && "$sftp_service_enabled" -ne 1 ]]; then
                 info "${nv_mod}: ${nv_var}=${nv_port} skipped (sftp.service is not enabled)"
                 continue
@@ -1513,7 +1520,7 @@ if [[ -n "$nethvoice_modules" ]]; then
 
         # Compare configured Asterisk ports from the module environment with the
         # actual ports currently owned by the asterisk process on the host.
-        expected_asterisk_ports=$(echo "$nv_port_vars" | awk -F= '/^(ASTERISK_SIP_PORT|ASTERISK_SIPS_PORT|ASTERISK_IAX_PORT|ASTERISK_WS_PORT|ASTERISK_WSS_PORT|ASTMANAGERPORT)=/{print $2}' | sort -n -u | xargs)
+        expected_asterisk_ports=$(echo "$nv_port_vars" | awk -F= '/^(ASTERISK_SIP_PORT|ASTERISK_SIPS_PORT|ASTERISK_WS_PORT|ASTERISK_WSS_PORT|ASTMANAGERPORT)=/{print $2}' | sort -n -u | xargs)
         asterisk_listeners=$(ss -H -ltnup 2>/dev/null | grep 'users:(("asterisk"' || true)
         actual_asterisk_ports=$(echo "$asterisk_listeners" | awk '{print $5}' | awk -F: '{print $NF}' | grep -E '^[0-9]+$' | sort -n -u | xargs)
 

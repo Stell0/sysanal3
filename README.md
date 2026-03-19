@@ -10,6 +10,12 @@ Run as **root** on a NethServer 8 node:
 bash <(curl -sfL https://raw.githubusercontent.com/Stell0/sysanal3/main/sysanal3)
 ```
 
+Run in silent mode to suppress `OK` messages and most `INFO` messages while still printing the full **General System Data** section:
+
+```bash
+bash <(curl -sfL https://raw.githubusercontent.com/Stell0/sysanal3/main/sysanal3) -- --silent
+```
+
 ## What it does
 
 The script executes a series of automated checks and reports all detected **problems** and **warnings**.
@@ -47,6 +53,7 @@ The certificate checks require `openssl` to be available on the host. If `openss
 
 | Flag | Description |
 |------|-------------|
+| `-s`, `--silent` | Suppress `OK` messages and most `INFO` messages. Warnings, problems, headers, the full General System Data section, and the final summary are still printed. |
 | `--worker` | Parsed for compatibility; currently does not change check flow in this script version. |
 
 ## Configurable constants
