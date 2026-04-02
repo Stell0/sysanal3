@@ -44,6 +44,7 @@ It exits with code `1` if problems are found, otherwise `0`.
 	- **MariaDB `asterisk.kvstore_Sipsettings` localnets**: Flags a problem if a `localnets` row exists.
 	- **FreePBX email sender**: Warns if neither `SMTP_FROM_ADDRESS=...` in the `freepbx` container nor `/etc/asterisk/voicemail.conf` `mailcmd=/var/lib/asterisk/bin/send_email -f ...` is configured.
 	- **Asterisk PJSIP contacts**: Counts registered PJSIP contacts. Warns if zero and Asterisk is running.
+	- **Asterisk AstDB AMPUSER cidname**: Warns if an entry with empty extension exists, such as `/AMPUSER//cidname`, and suggests running `database del AMPUSER/ cidname` in the Asterisk CLI.
 	- **Asterisk AstDB call forward (CF)**: Warns for each extension that has `CF` enabled and flags circular call forward chains as problems.
 	- **Asterisk queue ring strategy**: Warns if more than 3 queues use `ringall`, or if any `ringall` queue has more than 5 agents.
 	- Validate NethVoice `*PORT*` environment variables against listening processes (Asterisk/Kamailio ownership checks).

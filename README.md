@@ -40,6 +40,7 @@ It exits with code `1` if any problem is found, otherwise `0`.
   - Collects domain-to-URI routes from local `nethvoice-proxy` modules and verifies that each instance `NETHVOICE_HOST` points to `sip:<wg0 IPv4>:<ASTERISK_SIP_PORT>`.
   - Validates the certificate presented by each instance `NETHVOICE_HOST` on port `443` (TLS handshake, hostname match, non-expired certificate).
   - Asterisk PJSIP contacts count (warns if zero while Asterisk is running).
+  - AstDB `AMPUSER//cidname` check (warns if an empty-extension `cidname` entry exists and suggests `database del AMPUSER/ cidname` in the Asterisk CLI).
   - AstDB call forward check (warns for each extension with `CF` enabled and flags circular forwarding chains as problems).
   - Asterisk queue ring strategy check (warns if more than 3 queues use `ringall`, or any `ringall` queue has more than 5 agents).
   - Validates NethVoice `*PORT*` environment variables against listening processes (e.g. Asterisk/Kamailio ownership checks).

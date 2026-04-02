@@ -781,6 +781,34 @@ check_nethvoice_localnets() {
     fi
 }
 
+check_nethvoice_astdb_cidname() {
+    local nv_mod="$1"
+    local cidname_out wrong_cidname_entries
+
+    cidname_out=$(runagent -m "$nv_mod" podman exec freepbx asterisk -rx 'database show AMPUSER' 2>/dev/null || true)
+
+    if [[ -z "$cidname_out" ]]; then
+        info "${nv_mod}: could not retrieve AstDB AMPUSER entries"
+        return
+    fi
+
+    wrong_cidname_entries=$(echo "$cidname_out" | awk '
+        /^[[:space:]]*\/AMPUSER\/\/cidname[[:space:]]*:/ {
+            sub(/^[[:space:]]+/, "", $0)
+            print
+        }
+    ')
+
+    if [[ -n "$wrong_cidname_entries" ]]; then
+        warning "${nv_mod}: Wrong cidname in astdb, run \`database del AMPUSER/ cidname\` in asterisk CLI"
+        while read -r line; do
+            [[ -n "$line" ]] && echo "  ${line}"
+        done <<< "$wrong_cidname_entries"
+    else
+        ok "${nv_mod}: no wrong cidname entries in AstDB"
+    fi
+}
+
 check_nethvoice_email_from_address() {
     local nv_mod="$1"
     local smtp_from voicemail_mailcmd
@@ -1420,6 +1448,9 @@ if [[ -n "$nethvoice_modules" ]]; then
         else
             info "${nv_mod}: could not retrieve PJSIP contacts (Asterisk may not be running)"
         fi
+
+        # --- Asterisk AstDB AMPUSER cidname ---
+        check_nethvoice_astdb_cidname "$nv_mod"
 
         # --- Asterisk AstDB call forward (CF) ---
         cf_out=$(runagent -m "$nv_mod" podman exec freepbx asterisk -rx 'database show CF' 2>/dev/null || true)
