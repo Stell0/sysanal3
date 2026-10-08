@@ -81,24 +81,354 @@ info_always() { echo -e "${CYAN}[INFO]${NC} $*"; }
 ok()      { [[ ${SILENT:-0} -eq 1 ]] || echo -e "${GREEN}[OK]${NC} $*"; }
 header()  { echo ""; echo -e "${BOLD}=== $* ===${NC}"; }
 
+# Results are updated by direct calls in the parent shell, never by $(...).
+# Keep attempted paths on failure for diagnostics, but consumers require status 0.
+declare -A MODULE_PATH_STATUS=()
+declare -A MODULE_ENV_FILES=()
+declare -A MODULE_HOMES=()
+
+is_absolute_single_path() {
+    [[ "$1" == /* && ! "$1" =~ [[:cntrl:]] ]]
+}
+
+resolve_module_paths() {
+    local mod="$1" state_dir passwd_entry account_name module_home=""
+    local runtime_reason lookup_rc env_file failure_reason
+
+    if [[ -n "${MODULE_PATH_STATUS[$mod]+cached}" ]]; then
+        return "${MODULE_PATH_STATUS[$mod]}"
+    fi
+    MODULE_PATH_STATUS["$mod"]=1
+
+    # A sentinel preserves trailing newlines so extra blank lines are rejected.
+    if state_dir=$(timeout 5s runagent -m "$mod" printenv AGENT_STATE_DIR </dev/null 2>/dev/null
+        lookup_rc=$?; printf '.'; exit "$lookup_rc"); then
+        state_dir="${state_dir%.}"
+        state_dir="${state_dir%$'\n'}"
+        if is_absolute_single_path "$state_dir"; then
+            runtime_reason=""
+        else
+            runtime_reason="AGENT_STATE_DIR is empty or not a single absolute directory path"
+        fi
+    else
+        runtime_reason="AGENT_STATE_DIR lookup failed or timed out"
+    fi
+
+    # Also discover rootless homes for filesystem reporting. An account is not
+    # required when NS8 provides a valid state directory (rootful modules).
+    if passwd_entry=$(getent passwd "$mod" </dev/null 2>/dev/null
+        lookup_rc=$?; printf '.'; exit "$lookup_rc"); then
+        passwd_entry="${passwd_entry%.}"
+        passwd_entry="${passwd_entry%$'\n'}"
+        if [[ ! "$passwd_entry" =~ [[:cntrl:]] && "$passwd_entry" =~ ^([^:]*:){6}[^:]*$ ]]; then
+            IFS=: read -r account_name _ _ _ _ module_home _ <<< "$passwd_entry"
+            if [[ "$account_name" == "$mod" ]] && is_absolute_single_path "$module_home"; then
+                MODULE_HOMES["$mod"]="$module_home"
+            fi
+        fi
+    fi
+
+    if [[ -z "$runtime_reason" ]]; then
+        env_file="${state_dir%/}/environment"
+    elif [[ -n "${MODULE_HOMES[$mod]:-}" ]]; then
+        env_file="${MODULE_HOMES[$mod]%/}/.config/state/environment"
+    else
+        warning "${mod}: ${runtime_reason}; no valid NSS account home; environment-dependent checks skipped (check runagent and getent passwd ${mod})"
+        return 1
+    fi
+
+    MODULE_ENV_FILES["$mod"]="$env_file"
+    if [[ ! -e "$env_file" ]]; then
+        failure_reason="environment file is missing"
+    elif [[ ! -f "$env_file" ]]; then
+        failure_reason="environment path is not a regular file"
+    elif [[ ! -r "$env_file" ]]; then
+        failure_reason="environment file is unreadable"
+    else
+        MODULE_PATH_STATUS["$mod"]=0
+        return 0
+    fi
+
+    warning "${mod}: ${failure_reason} (${env_file}); environment-dependent checks skipped (check path and permissions)"
+    return 1
+}
+
+resolve_local_module_paths() {
+    local mod
+    while IFS= read -r mod; do
+        [[ -z "$mod" ]] && continue
+        resolve_module_paths "$mod" || true
+    done <<< "$MODULES"
+}
+
+report_module_home_filesystems() {
+    local mod module_home target root_target usage pct
+    local -A reported_targets=([/]=1)
+    root_target=$(findmnt -n -o TARGET --target / 2>/dev/null) || root_target="/"
+    [[ -n "$root_target" ]] && reported_targets["$root_target"]=1
+
+    while IFS= read -r mod; do
+        [[ -z "$mod" ]] && continue
+        module_home="${MODULE_HOMES[$mod]:-}"
+        [[ -z "$module_home" ]] && continue
+        target=$(findmnt -n -o TARGET --target "$module_home" 2>/dev/null) || continue
+        [[ -z "$target" || -n "${reported_targets[$target]+reported}" ]] && continue
+        reported_targets["$target"]=1
+        usage=$(df -h -- "$module_home" 2>/dev/null | awk 'NR==2{printf "%s used / %s total (%s full)", $3, $2, $5}')
+        info_always "${target} filesystem (module homes): ${usage:-N/A}"
+        pct=$(df -P -- "$module_home" 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}')
+        if [[ "$pct" =~ ^[0-9]+$ ]] && (( pct >= 90 )); then
+            problem "${target} filesystem usage at ${pct}% (>= 90%)"
+        fi
+    done <<< "$MODULES"
+    return 0
+}
+
 LOCAL_IPS_DISPLAY="N/A"
 PUBLIC_IP=""
 LOCAL_VPN_ADDRESS=""
 NETHVOICE_PROXY_MODULE_COUNT=0
 NETHVOICE_PROXY_ROUTE_COUNT=0
 
+# Discover the module execution UID, rather than assuming every module is rootless.
+declare -A MODULE_RUNTIME_UIDS=()
+declare -A MODULE_RUNTIME_STATUS=()
+
+resolve_module_runtime() {
+    local mod="$1" runtime_uid
+    if [[ -n "${MODULE_RUNTIME_STATUS[$mod]+cached}" ]]; then
+        return "${MODULE_RUNTIME_STATUS[$mod]}"
+    fi
+    MODULE_RUNTIME_STATUS["$mod"]=1
+    if runtime_uid=$(timeout 5s runagent -m "$mod" id -u </dev/null 2>/dev/null) &&
+        [[ "$runtime_uid" =~ ^[0-9]+$ ]]; then
+        MODULE_RUNTIME_UIDS["$mod"]="$runtime_uid"
+        MODULE_RUNTIME_STATUS["$mod"]=0
+        return 0
+    fi
+    warning "${mod}: cannot determine module execution UID; container and service checks skipped"
+    return 1
+}
+
+check_module_services() {
+    local mod="$1" service_output line key value
+    local -a manager_args=() unit_args=()
+    local -A properties=()
+    resolve_module_runtime "$mod" || return 0
+    if [[ "${MODULE_RUNTIME_UIDS[$mod]}" == 0 ]]; then
+        # Only module-owned system units; do not inspect the whole host per module.
+        unit_args=("${mod}.service" "${mod}-*.service")
+    else
+        manager_args=(--user)
+    fi
+    if ! service_output=$(timeout 15s runagent -m "$mod" systemctl "${manager_args[@]}" show \
+        --all --type=service --no-pager \
+        --property=Id,Type,LoadState,ActiveState,SubState,UnitFileState,Result,NRestarts,TriggeredBy,ConditionResult \
+        "${unit_args[@]}" </dev/null 2>/dev/null); then
+        warning "${mod}: cannot query module services"
+        return 0
+    fi
+    # systemctl show returns property blocks separated by blank lines.
+    while IFS= read -r line; do
+        if [[ -z "$line" ]]; then
+            report_module_service_state "$mod" properties
+            properties=()
+        elif [[ "$line" == *=* ]]; then
+            key="${line%%=*}"; value="${line#*=}"
+            case "$key" in
+                Id|Type|LoadState|ActiveState|SubState|UnitFileState|Result|NRestarts|TriggeredBy|ConditionResult)
+                    # Read through the nameref in report_module_service_state.
+                    # shellcheck disable=SC2034
+                    properties["$key"]="$value" ;;
+            esac
+        fi
+    done <<< "$service_output"$'\n'
+    return 0
+}
+
+report_module_service_state() {
+    local mod="$1"
+    local -n service_props="$2"
+    local unit="${service_props[Id]:-}" restarts="${service_props[NRestarts]:-}"
+    [[ -z "$unit" || "${service_props[LoadState]:-}" != loaded ]] && return 0
+    if [[ "${service_props[ActiveState]:-}" == failed ]]; then
+        problem "${mod}: service ${unit} is failed"
+    elif [[ "${service_props[ActiveState]:-}" == inactive &&
+        "${service_props[Type]:-}" != oneshot &&
+        "${service_props[ConditionResult]:-}" != no &&
+        -z "${service_props[TriggeredBy]:-}" &&
+        "${service_props[UnitFileState]:-}" =~ ^enabled(-runtime)?$ ]]; then
+        warning "${mod}: enabled service ${unit} is inactive"
+    fi
+    if [[ "${service_props[ActiveState]:-}" != failed ]]; then
+        case "${service_props[Result]:-}" in
+            exit-code|signal|core-dump|timeout|watchdog|start-limit-hit|resources|protocol|oom-kill)
+                warning "${mod}: service ${unit} last run ended with ${service_props[Result]}" ;;
+        esac
+    fi
+    if [[ "${service_props[SubState]:-}" == auto-restart ]]; then
+        if [[ "$restarts" =~ ^[0-9]+$ ]] && (( restarts > RESTART_THRESHOLD )); then
+            problem "${mod}: service ${unit} is repeatedly restarting (${restarts} automatic restarts)"
+        else
+            warning "${mod}: service ${unit} is waiting for automatic restart"
+        fi
+    elif [[ "$restarts" =~ ^[0-9]+$ ]] && (( restarts > RESTART_THRESHOLD )); then
+        warning "${mod}: service ${unit} has ${restarts} automatic restarts since counter reset; check recent logs (threshold: ${RESTART_THRESHOLD})"
+    fi
+    return 0
+}
+
+check_module_containers() {
+    local mod="$1" container_ids container_output id name state restarts oom health extra
+    local -a ids=()
+    local format='{{.Name}}|{{.State.Status}}|{{.RestartCount}}|{{.State.OOMKilled}}|{{if .State.Healthcheck}}{{.State.Healthcheck.Status}}{{end}}'
+    resolve_module_runtime "$mod" || return 0
+    if ! container_ids=$(timeout 15s runagent -m "$mod" podman ps -a --format '{{.ID}}|{{.Names}}' </dev/null 2>/dev/null); then
+        warning "${mod}: cannot list module containers"
+        return 0
+    fi
+    [[ -z "$container_ids" ]] && return 0
+    while IFS='|' read -r id name extra; do
+        [[ "$id" =~ ^[a-f0-9]{12,64}$ && "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ && -z "$extra" ]] || {
+            warning "${mod}: invalid container inventory; container checks skipped"
+            return 0
+        }
+        if [[ "${MODULE_RUNTIME_UIDS[$mod]}" == 0 ]]; then
+            # Rootful Podman is shared with the host. NS8-owned containers use
+            # the module ID or its hyphen-prefixed component names.
+            [[ "$name" == "$mod" || "$name" == "$mod-"* ]] || continue
+        fi
+        ids+=("$id")
+    done <<< "$container_ids"
+    [[ ${#ids[@]} -eq 0 ]] && return 0
+    # Inspect selected fields only: full inspect output contains environment secrets.
+    if ! container_output=$(timeout 15s runagent -m "$mod" podman inspect --format "$format" -- "${ids[@]}" </dev/null 2>/dev/null); then
+        warning "${mod}: cannot inspect module container health"
+        return 0
+    fi
+    while IFS='|' read -r name state restarts oom health extra; do
+        name="${name#/}"
+        if [[ ! "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ || ! "$restarts" =~ ^[0-9]+$ ||
+            ! "$oom" =~ ^(true|false)$ || -n "$extra" ||
+            ! "$state" =~ ^(configured|created|initialized|running|stopped|exited|paused|restarting|removing|dead|unknown)$ ||
+            ! "$health" =~ ^(healthy|unhealthy|starting)?$ ]]; then
+            warning "${mod}: invalid container health data"
+            continue
+        fi
+        info "${mod}: container ${name} (state: ${state}, restarts: ${restarts}, health: ${health:-not configured})"
+        case "$state" in
+            created|exited|stopped|paused) warning "${mod}: container ${name} is ${state}" ;;
+            dead) problem "${mod}: container ${name} is dead" ;;
+        esac
+        if (( restarts > RESTART_THRESHOLD )); then
+            problem "${mod}: container ${name} has ${restarts} restarts (threshold: ${RESTART_THRESHOLD})"
+        fi
+        [[ "$oom" == true ]] && problem "${mod}: container ${name} was killed due to memory exhaustion (OOM)"
+        [[ "$health" == unhealthy ]] && problem "${mod}: container ${name} is unhealthy"
+    done <<< "$container_output"
+    return 0
+}
+
+check_node_memory() {
+    local meminfo_file="${1:-/proc/meminfo}" memory_total memory_available swap_total swap_free
+    local used_pct swap_used
+    read -r memory_total memory_available swap_total swap_free < <(awk '
+        /^MemTotal:/ {total=$2; have_total=1} /^MemAvailable:/ {available=$2; have_available=1}
+        /^SwapTotal:/ {swap_total=$2} /^SwapFree:/ {swap_free=$2}
+        END {
+            if (!have_total || !have_available) print "unknown unknown 0 0"
+            else print total, available, swap_total+0, swap_free+0
+        }
+    ' "$meminfo_file" 2>/dev/null)
+    if [[ ! "$memory_total" =~ ^[0-9]+$ || "$memory_total" == 0 ||
+        ! "$memory_available" =~ ^[0-9]+$ ]] || (( memory_available > memory_total )); then
+        warning "Cannot determine available node memory"
+        return 0
+    fi
+    used_pct=$(( (memory_total - memory_available) * 100 / memory_total ))
+    info_always "Memory: ${memory_available} KiB available / ${memory_total} KiB total (${used_pct}% used, accounting for reclaimable cache)"
+    if (( used_pct >= MEMORY_PROBLEM_PCT )); then
+        problem "Node memory usage at ${used_pct}% (>= ${MEMORY_PROBLEM_PCT}%)"
+    elif (( used_pct >= MEMORY_WARNING_PCT )); then
+        warning "Node memory usage at ${used_pct}% (>= ${MEMORY_WARNING_PCT}%)"
+    fi
+    if [[ "$swap_total" =~ ^[0-9]+$ && "$swap_free" =~ ^[0-9]+$ ]] && (( swap_free <= swap_total )); then
+        swap_used=$(( swap_total - swap_free ))
+        info_always "Swap: ${swap_used} KiB used / ${swap_total} KiB total"
+    fi
+    return 0
+}
+
+check_nethvoice_asterisk_runtime() {
+    local mod="$1" output version uptime reload_age channels calls
+    if output=$(timeout 10s runagent -m "$mod" podman exec freepbx asterisk -rx 'core show version' </dev/null 2>/dev/null) &&
+        version=$(printf '%s\n' "$output" | grep -oE '^Asterisk [0-9][0-9A-Za-z._+-]*' | head -1) && [[ -n "$version" ]]; then
+        info "${mod}: ${version}"
+    else
+        warning "${mod}: cannot query Asterisk version (FreePBX/Asterisk may not be running)"
+        return 0
+    fi
+    if output=$(timeout 10s runagent -m "$mod" podman exec freepbx asterisk -rx 'core show uptime seconds' </dev/null 2>/dev/null); then
+        uptime=$(printf '%s\n' "$output" | sed -nE 's/^System uptime: *([0-9]+) *$/\1/p')
+        reload_age=$(printf '%s\n' "$output" | sed -nE 's/^Last reload: *([0-9]+) *$/\1/p')
+        [[ "$reload_age" =~ ^[0-9]+$ ]] || reload_age=""
+        if [[ "$uptime" =~ ^[0-9]+$ ]]; then
+            info "${mod}: Asterisk uptime ${uptime}s${reload_age:+, last reload ${reload_age}s ago}"
+        else
+            warning "${mod}: invalid Asterisk uptime data"
+        fi
+    else
+        warning "${mod}: cannot query Asterisk uptime"
+    fi
+    if output=$(timeout 10s runagent -m "$mod" podman exec freepbx asterisk -rx 'core show channels count' </dev/null 2>/dev/null); then
+        channels=$(printf '%s\n' "$output" | sed -nE 's/^([0-9]+) active channels? *$/\1/p')
+        calls=$(printf '%s\n' "$output" | sed -nE 's/^([0-9]+) active calls? *$/\1/p')
+        if [[ "$channels" =~ ^[0-9]+$ && "$calls" =~ ^[0-9]+$ ]]; then
+            info "${mod}: Asterisk active channels: ${channels}, active calls: ${calls}"
+        else
+            warning "${mod}: invalid Asterisk active-call counts"
+        fi
+    else
+        warning "${mod}: cannot query Asterisk active-call counts"
+    fi
+    return 0
+}
+
+check_nethvoice_pjsip_contacts() {
+    local mod="$1" contact_count
+    # Filter inside the container so contact URIs and device identities stay there.
+    # The variable expansion belongs to the container shell.
+    # shellcheck disable=SC2016
+    if contact_count=$(timeout 10s runagent -m "$mod" podman exec freepbx sh -c '
+        output=$(asterisk -rx "pjsip show contacts") || exit 1
+        printf "%s\n" "$output" | sed -nE "s/^Objects found: *([0-9]+) *$/\\1/p"
+    ' </dev/null 2>/dev/null) && [[ "$contact_count" =~ ^[0-9]+$ ]]; then
+        info "${mod}: PJSIP contact objects: ${contact_count}"
+        if [[ "$contact_count" == 0 ]]; then
+            warning "${mod}: Asterisk running but zero PJSIP contacts"
+        fi
+    else
+        warning "${mod}: cannot retrieve PJSIP contact count"
+    fi
+    return 0
+}
+
 get_listener_lines_by_port() {
-    local port="$1"
+    local port="$1" protocol="${2:-any}"
     {
-        ss -H -ltnp "( sport = :${port} )" 2>/dev/null
-        ss -H -lunp "( sport = :${port} )" 2>/dev/null
+        if [[ "$protocol" != udp ]]; then
+            ss -H -ltnp "( sport = :${port} )" 2>/dev/null
+        fi
+        if [[ "$protocol" != tcp ]]; then
+            ss -H -lunp "( sport = :${port} )" 2>/dev/null
+        fi
     } | sed '/^$/d'
 }
 
 get_listener_processes_by_port() {
-    local port="$1"
+    local port="$1" protocol="${2:-any}"
     local listeners
-    listeners=$(get_listener_lines_by_port "$port")
+    listeners=$(get_listener_lines_by_port "$port" "$protocol")
     if [[ -z "$listeners" ]]; then
         return
     fi
@@ -122,10 +452,10 @@ check_port() {
 }
 
 check_port_owner() {
-    local desc="$1" port="$2" expected_regex="$3" expected_service="$4"
+    local desc="$1" port="$2" expected_regex="$3" expected_service="$4" protocol="${5:-any}"
     local listeners processes
-    listeners=$(get_listener_lines_by_port "$port")
-    processes=$(get_listener_processes_by_port "$port")
+    listeners=$(get_listener_lines_by_port "$port" "$protocol")
+    processes=$(get_listener_processes_by_port "$port" "$protocol")
 
     if [[ -z "$listeners" ]]; then
         problem "${desc}: port ${port} is NOT listening"
@@ -144,7 +474,7 @@ check_port_owner() {
 get_whitelist_port_expected_service() {
     case "$1" in
         APACHE_PORT|TANCREDIPORT) echo "apache2" ;;
-        ASTERISK_IAX_PORT|ASTERISK_SIPS_PORT|ASTERISK_SIP_PORT|ASTERISK_WSS_PORT|ASTERISK_WS_PORT|ASTMANAGERPORT) echo "asterisk" ;;
+        ASTERISK_IAX_PORT|ASTERISK_SIPS_PORT|ASTERISK_SIP_PORT|ASTERISK_SIP_UDP_PORT|ASTERISK_WSS_PORT|ASTERISK_WS_PORT|ASTMANAGERPORT) echo "asterisk" ;;
         JANUS_TRANSPORT_PORT) echo "janus" ;;
         NETHCTI_DB_PORT|NETHVOICE_MARIADB_PORT|PHONEBOOK_DB_PORT) echo "mariadbd" ;;
         NETHCTI_INTERNAL_REST_PORT[1-9]|NETHCTI_INTERNAL_REST_PORT1[0-3]|NETHCTI_SERVER_API_PORT|NETHCTI_SERVER_WS_PORT|NETHCTI_TCP_PORT|NETHCTI_TLS_PORT) echo "node" ;;
@@ -167,7 +497,7 @@ get_whitelist_port_expected_service() {
 get_whitelist_port_expected_regex() {
     case "$1" in
         APACHE_PORT|TANCREDIPORT) echo '(^| )apache2( |$)' ;;
-        ASTERISK_IAX_PORT|ASTERISK_SIPS_PORT|ASTERISK_SIP_PORT|ASTERISK_WSS_PORT|ASTERISK_WS_PORT|ASTMANAGERPORT) echo '(^| )asterisk( |$)' ;;
+        ASTERISK_IAX_PORT|ASTERISK_SIPS_PORT|ASTERISK_SIP_PORT|ASTERISK_SIP_UDP_PORT|ASTERISK_WSS_PORT|ASTERISK_WS_PORT|ASTMANAGERPORT) echo '(^| )asterisk( |$)' ;;
         JANUS_TRANSPORT_PORT) echo '(^| )janus( |$)' ;;
         NETHCTI_DB_PORT|NETHVOICE_MARIADB_PORT|PHONEBOOK_DB_PORT) echo '(^| )mariadbd( |$)' ;;
         NETHCTI_INTERNAL_REST_PORT[1-9]|NETHCTI_INTERNAL_REST_PORT1[0-3]|NETHCTI_SERVER_API_PORT|NETHCTI_SERVER_WS_PORT|NETHCTI_TCP_PORT|NETHCTI_TLS_PORT) echo '(^| )node( |$)' ;;
@@ -242,10 +572,11 @@ check_configured_service_port() {
 }
 
 audit_whitelist_ports_for_module() {
-    local mod="$1" env_file="$2"
+    local mod="$1" env_file
     local var_name port expected_regex expected_service
 
-    [[ -f "$env_file" ]] || return 0
+    resolve_module_paths "$mod" || return 0
+    env_file="${MODULE_ENV_FILES[$mod]}"
 
     while read -r var_name; do
         [[ -z "$var_name" ]] && continue
@@ -328,6 +659,8 @@ probe_hairpin_sip() {
         return 2
     }
 
+    # Both numeric format and range must pass.
+    # shellcheck disable=SC2015
     [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || {
         echo "invalid port: $port" >&2
         return 2
@@ -383,6 +716,8 @@ probe_hairpin_sip() {
     }
 
     # Read one UDP datagram, not a "line"
+    # Consume a datagram; its contents are intentionally not reported.
+    # shellcheck disable=SC2034
     if ! response="$(timeout 4 dd bs=65535 count=1 status=none <&3 2>/dev/null)"; then
         exec 3>&-
         exec 3<&-
@@ -480,8 +815,7 @@ probe_tls_certificate() {
         return 7
     fi
 
-    openssl_out=$(timeout 8 openssl s_client -connect "${hostname}:${port}" -servername "$hostname" -showcerts </dev/null 2>&1)
-    if [[ $? -ne 0 ]]; then
+    if ! openssl_out=$(timeout 8 openssl s_client -connect "${hostname}:${port}" -servername "$hostname" -showcerts </dev/null 2>&1); then
         rm -f "$cert_file"
         TLS_CERT_ERROR=$(echo "$openssl_out" | awk 'NF { line=$0 } END { print line }')
         TLS_CERT_ERROR=${TLS_CERT_ERROR:-connection failed}
@@ -707,13 +1041,11 @@ SQL
 }
 
 check_nethvoice_proxy_domain_uri() {
-    local nv_mod="$1" nv_env_file="$2"
-    local nethvoice_host expected_sip_port expected_uri actual_uri proxy_source
+    local nv_mod="$1" nv_env_file
+    local nethvoice_host expected_sip_port expected_uri actual_uri proxy_source proxy_ip route_host
 
-    if [[ ! -f "$nv_env_file" ]]; then
-        warning "${nv_mod}: cannot read environment file (${nv_env_file}) for proxy domain URI validation"
-        return
-    fi
+    resolve_module_paths "$nv_mod" || return 0
+    nv_env_file="${MODULE_ENV_FILES[$nv_mod]}"
 
     nethvoice_host=$(get_env_var "$nv_env_file" "NETHVOICE_HOST")
     if [[ -z "$nethvoice_host" ]]; then
@@ -721,16 +1053,31 @@ check_nethvoice_proxy_domain_uri() {
         return
     fi
 
-    expected_sip_port=$(get_env_numeric_var "$nv_env_file" "ASTERISK_SIP_PORT")
+    # Newer versions route proxy signaling to a separately allocated UDP port.
+    expected_sip_port=$(get_env_numeric_var "$nv_env_file" "ASTERISK_SIP_UDP_PORT")
+    if [[ -z "$(get_env_var "$nv_env_file" "ASTERISK_SIP_UDP_PORT")" ]]; then
+        expected_sip_port=$(get_env_numeric_var "$nv_env_file" "ASTERISK_SIP_PORT")
+    fi
     if [[ -z "$expected_sip_port" ]]; then
-        warning "${nv_mod}: ASTERISK_SIP_PORT is not set; proxy domain URI validation skipped"
+        warning "${nv_mod}: proxy SIP port (ASTERISK_SIP_UDP_PORT or ASTERISK_SIP_PORT) is missing or invalid; proxy domain URI validation skipped"
         return
     fi
 
-    if [[ -z "$LOCAL_VPN_ADDRESS" ]]; then
-        warning "${nv_mod}: cannot determine LOCAL_VPN_ADDRESS from wg0; proxy domain URI validation skipped"
+    proxy_ip=$(get_env_var "$nv_env_file" "PROXY_IP")
+    if [[ -z "$proxy_ip" ]]; then
+        proxy_ip="$LOCAL_VPN_ADDRESS"
+        info "${nv_mod}: PROXY_IP is unavailable; using the local wg0 address for route validation"
+    fi
+    if [[ -z "$proxy_ip" ]]; then
+        warning "${nv_mod}: cannot determine proxy address; proxy domain URI validation skipped"
         return
     fi
+    if ! is_local_ip "$proxy_ip" && [[ "$proxy_ip" != "$LOCAL_VPN_ADDRESS" ]]; then
+        problem "${nv_mod}: configured PROXY_IP does not belong to this node; proxy domain URI validation skipped"
+        return
+    fi
+    route_host="$proxy_ip"
+    [[ "$route_host" == *:* ]] && route_host="[${route_host}]"
 
     if [[ "$NETHVOICE_PROXY_ROUTE_COUNT" -eq 0 ]]; then
         info "${nv_mod}: proxy domain URI validation skipped: no nethvoice-proxy routes available"
@@ -742,7 +1089,7 @@ check_nethvoice_proxy_domain_uri() {
         return
     fi
 
-    expected_uri="sip:${LOCAL_VPN_ADDRESS}:${expected_sip_port}"
+    expected_uri="sip:${route_host}:${expected_sip_port}"
     actual_uri="${NETHVOICE_PROXY_DOMAIN_URI_MAP[$nethvoice_host]}"
     proxy_source="${NETHVOICE_PROXY_DOMAIN_SOURCE_MAP[$nethvoice_host]}"
 
@@ -757,6 +1104,8 @@ check_nethvoice_localnets() {
     local nv_mod="$1"
     local localnets_out localnets_rc
 
+    # Database credentials expand inside the container, not on the host.
+    # shellcheck disable=SC2016
     localnets_out=$(runagent -m "$nv_mod" podman exec mariadb \
         sh -c 'mysql -uroot -p${MARIADB_ROOT_PASSWORD} -N -B asterisk -e "SELECT \`key\`, val, type, id FROM kvstore_Sipsettings WHERE \`key\` = '\''localnets'\'';"' 2>&1)
     localnets_rc=$?
@@ -827,94 +1176,195 @@ check_nethvoice_email_from_address() {
     fi
 }
 
+# Inspect a bounded tail in one pass; print pattern names, never log records.
+scan_recent_log_patterns() {
+    local log_file="$1" patterns="$2" status
+    local -a scan_status=()
+    [[ "$LOG_SCAN_MAX_BYTES" =~ ^[1-9][0-9]*$ && "$LOG_SCAN_MAX_LINES" =~ ^[1-9][0-9]*$ ]] || return 2
+    tail -c "$LOG_SCAN_MAX_BYTES" -- "$log_file" 2>/dev/null |
+        tail -n "$LOG_SCAN_MAX_LINES" |
+        SYSANAL_LOG_PATTERNS="$patterns" awk '
+            BEGIN {
+                count=split(ENVIRON["SYSANAL_LOG_PATTERNS"], patterns, "\n")
+                for (i=1; i<=count; i++) folded[i]=tolower(patterns[i])
+            }
+            {
+                line=tolower($0)
+                for (i=1; i<=count; i++)
+                    if (patterns[i] != "" && !matched[i] && line ~ folded[i]) matched[i]=1
+            }
+            END {
+                for (i=1; i<=count; i++) if (matched[i]) print patterns[i]
+            }'
+    scan_status=("${PIPESTATUS[@]}")
+    for status in "${scan_status[@]}"; do
+        [[ "$status" == 0 ]] || return 2
+    done
+    return 0
+}
+
 check_nethvoice_asterisk_full_logs() {
-    local nv_mod="$1"
-    local log_scan_out log_scan_rc match_tag pattern matched_line
-
-    if ! runagent -m "$nv_mod" podman exec freepbx test -f /var/log/asterisk/full 2>/dev/null; then
-        warning "${nv_mod}: /var/log/asterisk/full does not exist"
-        return
+    local nv_mod="$1" log_scan_out pattern
+    # Send our fixed helper source as stdin; environment values remain arguments.
+    # FreePBX has Bash; unavailable runtimes are reported as skipped checks.
+    # shellcheck disable=SC2016
+    if ! log_scan_out=$({
+        declare -f scan_recent_log_patterns
+        printf '%s\n' 'LOG_SCAN_MAX_BYTES="$3"; LOG_SCAN_MAX_LINES="$4"; scan_recent_log_patterns "$1" "$2"'
+    } | timeout 15s runagent -m "$nv_mod" podman exec -i freepbx bash -s -- \
+        /var/log/asterisk/full "$ASTERISK_FULL_LOG_ERROR_PATTERNS" \
+        "$LOG_SCAN_MAX_BYTES" "$LOG_SCAN_MAX_LINES" 2>/dev/null); then
+        warning "${nv_mod}: could not scan the recent Asterisk full log (check file readability and container runtime)"
+        return 0
     fi
-
-    log_scan_out=$(runagent -m "$nv_mod" podman exec freepbx sh -c '
-patterns="$1"
-status=1
-
-old_ifs=$IFS
-IFS="
-"
-for pattern in $patterns; do
-    [ -n "$pattern" ] || continue
-
-    match=$(grep -E -i -m 1 -- "$pattern" /var/log/asterisk/full 2>/dev/null || true)
-    if [ -z "$match" ]; then
-        for file in /var/log/asterisk/full.*.gz; do
-            [ -e "$file" ] || continue
-            match=$(gzip -cd -- "$file" 2>/dev/null | grep -E -i -m 1 -- "$pattern" || true)
-            [ -n "$match" ] && break
-        done
-    fi
-
-    if [ -n "$match" ]; then
-        printf "MATCH\t%s\t%s\n" "$pattern" "$match"
-        status=0
-    fi
-done
-IFS=$old_ifs
-
-exit "$status"
-' sh "$ASTERISK_FULL_LOG_ERROR_PATTERNS" 2>/dev/null)
-    log_scan_rc=$?
-
-    if [[ "$log_scan_rc" -eq 0 && -n "$log_scan_out" ]]; then
-        while IFS=$'\t' read -r match_tag pattern matched_line; do
-            [[ "$match_tag" != "MATCH" || -z "$pattern" ]] && continue
-            problem "${nv_mod}: Asterisk full log contains common error pattern: grep -E '${pattern}' /var/log/asterisk/full*"
-            [[ -n "$matched_line" ]] && echo "  ${matched_line}"
-        done <<< "$log_scan_out"
-    elif [[ "$log_scan_rc" -eq 1 ]]; then
-        ok "${nv_mod}: No common error found in full log"
-    else
-        warning "${nv_mod}: could not scan /var/log/asterisk/full for common errors"
-    fi
+    while IFS= read -r pattern; do
+        [[ -z "$pattern" ]] && continue
+        problem "${nv_mod}: recent Asterisk full log contains common error pattern: ${pattern}"
+    done <<< "$log_scan_out"
+    [[ -z "$log_scan_out" ]] && ok "${nv_mod}: No common error found in the recent Asterisk full log"
+    return 0
 }
 
 check_system_messages_log() {
-    local log_scan_out log_scan_rc match_tag pattern matched_line
+    local log_file="${1:-/var/log/messages}" log_scan_out pattern
+    if [[ ! -f "$log_file" || ! -r "$log_file" ]]; then
+        warning "${log_file} is missing or unreadable"
+        return 0
+    fi
+    # The child owns its arguments and receives only our reviewed helper source.
+    # shellcheck disable=SC2016
+    if ! log_scan_out=$(timeout 15s bash -c \
+        'LOG_SCAN_MAX_BYTES="$3"; LOG_SCAN_MAX_LINES="$4"; source /dev/stdin; scan_recent_log_patterns "$1" "$2"' \
+        bash "$log_file" "$MESSAGES_LOG_ERROR_PATTERNS" "$LOG_SCAN_MAX_BYTES" "$LOG_SCAN_MAX_LINES" \
+        < <(declare -f scan_recent_log_patterns) 2>/dev/null); then
+        warning "Could not scan the recent ${log_file} for common errors"
+        return 0
+    fi
+    while IFS= read -r pattern; do
+        [[ -z "$pattern" ]] && continue
+        problem "${log_file} recent tail contains common error pattern: ${pattern}"
+    done <<< "$log_scan_out"
+    [[ -z "$log_scan_out" ]] && ok "No common error found in the recent ${log_file}"
+    return 0
+}
 
-    if [[ ! -f /var/log/messages ]]; then
-        warning "/var/log/messages does not exist"
-        return
+report_module_traefik_host() {
+    local mod="$1" _traefik_host
+    if resolve_module_paths "$mod"; then
+        _traefik_host=$(get_env_var "${MODULE_ENV_FILES[$mod]}" "TRAEFIK_HOST")
+        if [[ -n "$_traefik_host" ]]; then
+            info "${mod}: TRAEFIK_HOST=${_traefik_host}"
+        fi
+    fi
+}
+
+check_nethvoice_proxy_certificates() {
+    local proxy_mod="$1" proxy_env_file kml_default_fqdn
+    resolve_module_paths "$proxy_mod" || return 0
+    proxy_env_file="${MODULE_ENV_FILES[$proxy_mod]}"
+
+    kml_default_fqdn=$(get_env_var "$proxy_env_file" "KML_DEFAULT_FQDN")
+    if [[ -z "$kml_default_fqdn" ]]; then
+        warning "${proxy_mod}: KML_DEFAULT_FQDN is not set; certificate checks skipped"
+        return 0
     fi
 
-    log_scan_out=$(
-        patterns="$MESSAGES_LOG_ERROR_PATTERNS"
-        status=1
+    check_tls_certificate_endpoint "${proxy_mod} KML_DEFAULT_FQDN HTTPS" "$kml_default_fqdn" 443
+    check_tls_certificate_endpoint "${proxy_mod} KML_DEFAULT_FQDN SIP/TLS" "$kml_default_fqdn" 5061
+}
 
-        while IFS= read -r pattern; do
-            [[ -n "$pattern" ]] || continue
+check_nethvoice_certificate() {
+    local nv_mod="$1" nv_env_file nethvoice_host
+    if resolve_module_paths "$nv_mod"; then
+        nv_env_file="${MODULE_ENV_FILES[$nv_mod]}"
+        nethvoice_host=$(get_env_var "$nv_env_file" "NETHVOICE_HOST")
+        if [[ -z "$nethvoice_host" ]]; then
+            warning "${nv_mod}: NETHVOICE_HOST is not set; certificate check skipped"
+        else
+            check_tls_certificate_endpoint "${nv_mod} NETHVOICE_HOST HTTPS" "$nethvoice_host" 443
+        fi
+    fi
+}
 
-            matched_line=$(grep -E -i -m 1 -- "$pattern" /var/log/messages 2>/dev/null || true)
-            if [[ -n "$matched_line" ]]; then
-                printf 'MATCH\t%s\t%s\n' "$pattern" "$matched_line"
-                status=0
+check_nethvoice_asterisk_port_alignment() {
+    local nv_mod="$1" nv_env_file expected_asterisk_ports asterisk_listeners
+    local actual_asterisk_ports expected_port forbidden_port expected_sip_port pjsip_transports
+
+    # Forbidden listeners can be checked even when the environment is unavailable.
+    asterisk_listeners=$(ss -H -ltnup 2>/dev/null | grep 'users:(("asterisk"' || true)
+    actual_asterisk_ports=$(echo "$asterisk_listeners" | awk '{print $5}' | awk -F: '{print $NF}' | grep -E '^[0-9]+$' | sort -n -u | xargs)
+
+    for forbidden_port in 5060 5061; do
+        if echo " ${actual_asterisk_ports} " | grep -q " ${forbidden_port} "; then
+            problem "${nv_mod}: asterisk must not listen on forbidden port ${forbidden_port}"
+        fi
+    done
+
+    resolve_module_paths "$nv_mod" || return 0
+    nv_env_file="${MODULE_ENV_FILES[$nv_mod]}"
+
+    # Compare configured Asterisk ports from the module environment with the
+    # actual ports currently owned by the asterisk process on the host.
+    expected_asterisk_ports=$(printf '%s\n' \
+        "$(get_env_numeric_var "$nv_env_file" "ASTERISK_SIP_PORT")" \
+        "$(get_env_numeric_var "$nv_env_file" "ASTERISK_SIP_UDP_PORT")" \
+        "$(get_env_numeric_var "$nv_env_file" "ASTERISK_SIPS_PORT")" \
+        "$(get_env_numeric_var "$nv_env_file" "ASTERISK_WS_PORT")" \
+        "$(get_env_numeric_var "$nv_env_file" "ASTERISK_WSS_PORT")" \
+        "$(get_env_numeric_var "$nv_env_file" "ASTMANAGERPORT")" \
+        | grep -E '^[0-9]+$' | sort -n -u | xargs)
+
+    if [[ -n "$expected_asterisk_ports" ]]; then
+        for expected_port in $expected_asterisk_ports; do
+            if ! echo " ${actual_asterisk_ports} " | grep -q " ${expected_port} "; then
+                problem "${nv_mod}: asterisk is not listening on expected port ${expected_port}"
             fi
-        done <<< "$patterns"
+        done
+    fi
 
-        exit "$status"
-    )
-    log_scan_rc=$?
+    expected_sip_port=$(get_env_numeric_var "$nv_env_file" "ASTERISK_SIP_PORT")
+    if [[ -n "$expected_sip_port" ]]; then
+        pjsip_transports=$(runagent -m "$nv_mod" podman exec freepbx asterisk -rx 'pjsip show transports' 2>/dev/null || true)
+        if [[ -n "$pjsip_transports" ]]; then
+            if echo "$pjsip_transports" | grep -qE ":[[:space:]]*${expected_sip_port}([[:space:]]|$)|:${expected_sip_port}/"; then
+                ok "${nv_mod}: Asterisk PJSIP transport uses ASTERISK_SIP_PORT=${expected_sip_port}"
+            else
+                problem "${nv_mod}: Asterisk PJSIP transport does not use ASTERISK_SIP_PORT=${expected_sip_port}"
+            fi
+        fi
+    fi
+}
 
-    if [[ "$log_scan_rc" -eq 0 && -n "$log_scan_out" ]]; then
-        while IFS=$'\t' read -r match_tag pattern matched_line; do
-            [[ "$match_tag" != "MATCH" || -z "$pattern" ]] && continue
-            problem "/var/log/messages contains common error pattern: grep -E '${pattern}' /var/log/messages"
-            [[ -n "$matched_line" ]] && echo "  ${matched_line}"
-        done <<< "$log_scan_out"
-    elif [[ "$log_scan_rc" -eq 1 ]]; then
-        ok "No common error found in /var/log/messages"
+check_nethvoice_listening_ports() {
+    local nv_mod="$1" nv_env_file proxy_port asterisk_sip_port asterisk_sips_port asterisk_sip_udp_port
+    resolve_module_paths "$nv_mod" || return 0
+    nv_env_file="${MODULE_ENV_FILES[$nv_mod]}"
+
+    proxy_port=$(get_env_numeric_var "$nv_env_file" "PROXY_PORT")
+    asterisk_sip_port=$(get_env_numeric_var "$nv_env_file" "ASTERISK_SIP_PORT")
+    asterisk_sips_port=$(get_env_numeric_var "$nv_env_file" "ASTERISK_SIPS_PORT")
+    asterisk_sip_udp_port=$(get_env_numeric_var "$nv_env_file" "ASTERISK_SIP_UDP_PORT")
+
+    if [[ -n "$proxy_port" ]]; then
+        check_port_owner "${nv_mod} Kamailio SIP" "$proxy_port" '(^| )kamailio( |$)' "kamailio"
     else
-        warning "Could not scan /var/log/messages for common errors"
+        warning "${nv_mod}: PROXY_PORT is not set"
+    fi
+
+    if [[ -n "$asterisk_sip_port" ]]; then
+        check_port_owner "${nv_mod} Asterisk SIP" "$asterisk_sip_port" '(^| )asterisk( |$)' "asterisk"
+    else
+        warning "${nv_mod}: ASTERISK_SIP_PORT is not set"
+    fi
+
+    if [[ -n "$asterisk_sip_udp_port" ]]; then
+        check_port_owner "${nv_mod} Asterisk SIP UDP" "$asterisk_sip_udp_port" '(^| )asterisk( |$)' "asterisk" udp
+    fi
+
+    if [[ -n "$asterisk_sips_port" ]]; then
+        check_port_owner "${nv_mod} Asterisk SIPS" "$asterisk_sips_port" '(^| )asterisk( |$)' "asterisk"
+    else
+        warning "${nv_mod}: ASTERISK_SIPS_PORT is not set"
     fi
 }
 
@@ -974,13 +1424,21 @@ FATAL:
 EOF
 )
 
-RESTART_THRESHOLD=5            # Container restarts above this count flag a problem
+LOG_SCAN_MAX_BYTES=1048576     # Inspect at most the last 1 MiB of each active log
+LOG_SCAN_MAX_LINES=20000       # Inspect at most this many lines within that tail
+RESTART_THRESHOLD=5            # Container/service restarts above this count flag a problem
+MEMORY_WARNING_PCT=90          # Memory usage based on MemAvailable
+MEMORY_PROBLEM_PCT=95          # Severe memory usage threshold
 DNS_SLOW_MS=2000               # DNS resolution slower than this (ms) flags a problem
 QUEUE_RINGALL_MAX_QUEUES=3     # Warn if ringall strategy is used by more than this number of queues
 QUEUE_RINGALL_MAX_AGENTS=5     # Warn if any ringall queue has more than this number of agents
 INTERNET_OK=1                  # Set to 0 if connectivity precheck fails
-IS_WORKER=0                    # Set to 1 when running via SSH on a worker node
 SILENT=0                       # Set to 1 to suppress OK and INFO messages
+
+# Sourcing defines helpers for local tests without executing the analyzer.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -988,7 +1446,7 @@ SILENT=0                       # Set to 1 to suppress OK and INFO messages
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -s|--silent) SILENT=1; shift ;;
-        --worker) IS_WORKER=1; shift ;;
+        --worker) shift ;;
         *)        shift ;;
     esac
 done
@@ -1057,16 +1515,6 @@ if [[ -n "$_root_pct" && "$_root_pct" -ge 90 ]]; then
     problem "Root filesystem usage at ${_root_pct}% (>= 90%)"
 fi
 
-# /home filesystem usage (only if /home is a separate mount)
-if [[ "$(findmnt -n -o TARGET --target /home 2>/dev/null)" == "/home" ]]; then
-    _homefs=$(df -h /home 2>/dev/null | awk 'NR==2{printf "%s used / %s total (%s full)", $3, $2, $5}')
-    info_always "/home filesystem: ${_homefs:-N/A}"
-    _home_pct=$(df /home 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}')
-    if [[ -n "$_home_pct" && "$_home_pct" -ge 90 ]]; then
-        problem "/home filesystem usage at ${_home_pct}% (>= 90%)"
-    fi
-fi
-
 # CPU load average
 _cpu_cores=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || true)
 _load_avg_1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || true)
@@ -1078,6 +1526,9 @@ if [[ -n "$_cpu_cores" && -n "$_load_avg_1" ]]; then
         warning "CPU load average is ${_load_avg_1} on ${_cpu_cores} core(s) (> core count)"
     fi
 fi
+
+# Memory and swap pressure (uses available memory, including reclaimable cache)
+check_node_memory
 
 # Uptime
 info_always "Uptime: $(uptime -p 2>/dev/null || uptime | sed 's/.*up/up/' || echo 'N/A')"
@@ -1142,7 +1593,6 @@ if [[ -z "$NODE_ID" ]]; then
 fi
 
 # Leader-node detection and multi-node info
-LEADER_VPN_IP=$(redis-cli --raw hget node/1/vpn endpoint 2>/dev/null | cut -d: -f1 || true)
 TOTAL_NODES=$(redis-cli --raw KEYS 'node/*/vpn' 2>/dev/null | wc -l || echo 1)
 IS_LEADER=0
 if [[ "$NODE_ID" == "1" ]]; then
@@ -1195,6 +1645,11 @@ else
         info "  - ${mod_id} (${mod_name}) version ${mod_version}"
     done <<< "$MODULES_ON_NODE"
 fi
+
+# Resolve every local module once, then report home filesystems after discovery.
+resolve_local_module_paths
+header "General System Data: Module home filesystems"
+report_module_home_filesystems
 
 # ---------------------------------------------------------------------------
 # 3. Module version vs latest GitHub release
@@ -1257,29 +1712,8 @@ header "Check: Container health per module"
 
 if [[ -n "$MODULES" ]]; then
     while read -r mod; do
-        container_info=$(runagent -m "$mod" podman ps -a --format '{{.Names}} [Status:{{.Status}}] [Restarts:{{.Restarts}}]' 2>/dev/null || true)
-        if [[ -z "$container_info" ]]; then
-            continue
-        fi
-        info "Containers for ${mod}:"
-        while read -r cline; do
-            info "  ${cline}"
-            # Flag unhealthy states
-            if echo "$cline" | grep -qiE '\[Status:(Created|Exited|Paused)'; then
-                warning "${mod}: container not running — ${cline%% \[*}"
-            fi
-            # Flag high restart counts
-            _restarts=$(echo "$cline" | grep -oP '\[Restarts:\K[0-9]+' || echo 0)
-            if [[ "$_restarts" -gt "$RESTART_THRESHOLD" ]]; then
-                problem "${mod}: container ${cline%% \[*} has ${_restarts} restarts (threshold: ${RESTART_THRESHOLD})"
-            fi
-        done <<< "$container_info"
-
-        # Show TRAEFIK_HOST if present
-        _traefik_host=$(cat "/home/${mod}/.config/state/environment" 2>/dev/null | grep -oP '^TRAEFIK_HOST=\K.*' || true)
-        if [[ -n "$_traefik_host" ]]; then
-            info "${mod}: TRAEFIK_HOST=${_traefik_host}"
-        fi
+        check_module_containers "$mod"
+        report_module_traefik_host "$mod"
     done <<< "$MODULES"
 else
     info "No modules to check"
@@ -1301,26 +1735,10 @@ else
     ok "No failed system services"
 fi
 
-# Per-module (user services — failed and dead)
+# Per-module services use the manager appropriate to the execution UID.
 if [[ -n "$MODULES" ]]; then
-    while read -r mod; do
-        failed_user=$(runagent -m "$mod" systemctl --user --failed --no-legend --no-pager 2>/dev/null || true)
-        if [[ -n "$failed_user" ]]; then
-            problem "Failed services in module ${mod}:"
-            while read -r line; do
-                echo "  ${line}"
-            done <<< "$failed_user"
-        fi
-
-        # Also check for dead services (not failed but not running)
-        dead_services=$(runagent -m "$mod" systemctl --user list-units --type=service --no-legend --no-pager 2>/dev/null \
-            | awk '$3 == "inactive" || $4 == "dead" {print $1, $3, $4}' || true)
-        if [[ -n "$dead_services" ]]; then
-            warning "Dead/inactive services in module ${mod}:"
-            while read -r line; do
-                echo "  ${line}"
-            done <<< "$dead_services"
-        fi
+    while IFS= read -r mod; do
+        check_module_services "$mod"
     done <<< "$MODULES"
 fi
 
@@ -1331,7 +1749,7 @@ header "Check: Configured service port ownership"
 
 if [[ -n "$MODULES" ]]; then
     while read -r mod; do
-        audit_whitelist_ports_for_module "$mod" "/home/${mod}/.config/state/environment"
+        audit_whitelist_ports_for_module "$mod"
     done <<< "$MODULES"
 else
     info "No modules to check"
@@ -1349,21 +1767,7 @@ proxy_modules=$(echo "$MODULES_ON_NODE" | awk -F'|' '$4 == "nethvoice-proxy" {pr
 if [[ -n "$proxy_modules" ]]; then
     while read -r proxy_mod; do
         [[ -z "$proxy_mod" ]] && continue
-        proxy_env_file="/home/${proxy_mod}/.config/state/environment"
-
-        if [[ ! -f "$proxy_env_file" ]]; then
-            warning "${proxy_mod}: cannot read environment file (${proxy_env_file}) for certificate checks"
-            continue
-        fi
-
-        kml_default_fqdn=$(get_env_var "$proxy_env_file" "KML_DEFAULT_FQDN")
-        if [[ -z "$kml_default_fqdn" ]]; then
-            warning "${proxy_mod}: KML_DEFAULT_FQDN is not set; certificate checks skipped"
-            continue
-        fi
-
-        check_tls_certificate_endpoint "${proxy_mod} KML_DEFAULT_FQDN HTTPS" "$kml_default_fqdn" 443
-        check_tls_certificate_endpoint "${proxy_mod} KML_DEFAULT_FQDN SIP/TLS" "$kml_default_fqdn" 5061
+        check_nethvoice_proxy_certificates "$proxy_mod"
     done <<< "$proxy_modules"
 else
     info "No nethvoice-proxy modules found for KML_DEFAULT_FQDN certificate checks"
@@ -1374,7 +1778,6 @@ nethvoice_modules=$(echo "$MODULES_ON_NODE" | awk -F'|' '$4 == "nethvoice" {prin
 if [[ -n "$nethvoice_modules" ]]; then
     while read -r nv_mod; do
         info "Checking NethVoice module: ${nv_mod}"
-        nv_env_file="/home/${nv_mod}/.config/state/environment"
 
         # --- DNS resolution inside freepbx container ---
         dns_start=$(date +%s%N)
@@ -1394,6 +1797,8 @@ if [[ -n "$nethvoice_modules" ]]; then
 
         # --- mysqlcheck ---
         # Run mysqlcheck inside the mariadb container; root password is in $MARIADB_ROOT_PASSWORD
+        # Database credentials expand only inside the container.
+        # shellcheck disable=SC2016
         mysql_out=$(runagent -m "$nv_mod" podman exec mariadb \
             sh -c 'mysqlcheck -uroot -p${MARIADB_ROOT_PASSWORD} -A' 2>&1 || true)
 
@@ -1418,35 +1823,14 @@ if [[ -n "$nethvoice_modules" ]]; then
         check_nethvoice_asterisk_full_logs "$nv_mod"
 
         # --- nethvoice-proxy domain URI alignment ---
-        check_nethvoice_proxy_domain_uri "$nv_mod" "$nv_env_file"
+        check_nethvoice_proxy_domain_uri "$nv_mod"
 
         # --- public certificate checks ---
-        if [[ ! -f "$nv_env_file" ]]; then
-            warning "${nv_mod}: cannot read environment file (${nv_env_file}) for certificate checks"
-        else
-            nethvoice_host=$(get_env_var "$nv_env_file" "NETHVOICE_HOST")
-            if [[ -z "$nethvoice_host" ]]; then
-                warning "${nv_mod}: NETHVOICE_HOST is not set; certificate check skipped"
-            else
-                check_tls_certificate_endpoint "${nv_mod} NETHVOICE_HOST HTTPS" "$nethvoice_host" 443
-            fi
-        fi
+        check_nethvoice_certificate "$nv_mod"
 
         # --- Asterisk PJSIP contacts ---
-        pjsip_out=$(runagent -m "$nv_mod" podman exec freepbx asterisk -rx 'pjsip show contacts' 2>/dev/null || true)
-        if [[ -n "$pjsip_out" ]]; then
-            pjsip_count=$(echo "$pjsip_out" | grep -c '/sip:' || true)
-            info "${nv_mod}: PJSIP registered contacts: ${pjsip_count}"
-            if [[ "$pjsip_count" -eq 0 ]]; then
-                # Check if asterisk is actually running
-                ast_running=$(runagent -m "$nv_mod" podman exec freepbx pgrep asterisk 2>/dev/null || true)
-                if [[ -n "$ast_running" ]]; then
-                    warning "${nv_mod}: Asterisk running but zero PJSIP contacts registered"
-                fi
-            fi
-        else
-            info "${nv_mod}: could not retrieve PJSIP contacts (Asterisk may not be running)"
-        fi
+        check_nethvoice_asterisk_runtime "$nv_mod"
+        check_nethvoice_pjsip_contacts "$nv_mod"
 
         # --- Asterisk AstDB AMPUSER cidname ---
         check_nethvoice_astdb_cidname "$nv_mod"
@@ -1631,48 +2015,7 @@ if [[ -n "$nethvoice_modules" ]]; then
         fi
 
         # --- Asterisk environment port alignment ---
-        if [[ ! -f "$nv_env_file" ]]; then
-            warning "${nv_mod}: cannot read environment file (${nv_env_file}) for port checks"
-            continue
-        fi
-
-        # Compare configured Asterisk ports from the module environment with the
-        # actual ports currently owned by the asterisk process on the host.
-        expected_asterisk_ports=$(printf '%s\n' \
-            "$(get_env_numeric_var "$nv_env_file" "ASTERISK_SIP_PORT")" \
-            "$(get_env_numeric_var "$nv_env_file" "ASTERISK_SIPS_PORT")" \
-            "$(get_env_numeric_var "$nv_env_file" "ASTERISK_WS_PORT")" \
-            "$(get_env_numeric_var "$nv_env_file" "ASTERISK_WSS_PORT")" \
-            "$(get_env_numeric_var "$nv_env_file" "ASTMANAGERPORT")" \
-            | grep -E '^[0-9]+$' | sort -n -u | xargs)
-        asterisk_listeners=$(ss -H -ltnup 2>/dev/null | grep 'users:(("asterisk"' || true)
-        actual_asterisk_ports=$(echo "$asterisk_listeners" | awk '{print $5}' | awk -F: '{print $NF}' | grep -E '^[0-9]+$' | sort -n -u | xargs)
-
-        if [[ -n "$expected_asterisk_ports" ]]; then
-            for expected_port in $expected_asterisk_ports; do
-                if ! echo " ${actual_asterisk_ports} " | grep -q " ${expected_port} "; then
-                    problem "${nv_mod}: asterisk is not listening on expected port ${expected_port}"
-                fi
-            done
-        fi
-
-        for forbidden_port in 5060 5061; do
-            if echo " ${actual_asterisk_ports} " | grep -q " ${forbidden_port} "; then
-                problem "${nv_mod}: asterisk must not listen on forbidden port ${forbidden_port}"
-            fi
-        done
-
-        expected_sip_port=$(get_env_numeric_var "$nv_env_file" "ASTERISK_SIP_PORT")
-        if [[ -n "$expected_sip_port" ]]; then
-            pjsip_transports=$(runagent -m "$nv_mod" podman exec freepbx asterisk -rx 'pjsip show transports' 2>/dev/null || true)
-            if [[ -n "$pjsip_transports" ]]; then
-                if echo "$pjsip_transports" | grep -qE ":[[:space:]]*${expected_sip_port}([[:space:]]|$)|:${expected_sip_port}/"; then
-                    ok "${nv_mod}: Asterisk PJSIP transport uses ASTERISK_SIP_PORT=${expected_sip_port}"
-                else
-                    problem "${nv_mod}: Asterisk PJSIP transport does not use ASTERISK_SIP_PORT=${expected_sip_port}"
-                fi
-            fi
-        fi
+        check_nethvoice_asterisk_port_alignment "$nv_mod"
     done <<< "$nethvoice_modules"
 else
     info "No NethVoice modules found"
@@ -1693,34 +2036,7 @@ fi
 # NethVoice SIP ports
 if [[ -n "$nethvoice_modules" ]]; then
     while read -r nv_mod; do
-        nv_env_file="/home/${nv_mod}/.config/state/environment"
-        if [[ ! -f "$nv_env_file" ]]; then
-            warning "${nv_mod}: cannot read environment file (${nv_env_file}) for NethVoice port checks"
-            continue
-        fi
-
-        proxy_port=$(get_env_numeric_var "$nv_env_file" "PROXY_PORT")
-        asterisk_sip_port=$(get_env_numeric_var "$nv_env_file" "ASTERISK_SIP_PORT")
-        asterisk_sips_port=$(get_env_numeric_var "$nv_env_file" "ASTERISK_SIPS_PORT")
-
-        if [[ -n "$proxy_port" ]]; then
-            check_port_owner "${nv_mod} Kamailio SIP" "$proxy_port" '(^| )kamailio( |$)' "kamailio"
-        else
-            warning "${nv_mod}: PROXY_PORT is not set"
-        fi
-
-        if [[ -n "$asterisk_sip_port" ]]; then
-            check_port_owner "${nv_mod} Asterisk SIP" "$asterisk_sip_port" '(^| )asterisk( |$)' "asterisk"
-        else
-            warning "${nv_mod}: ASTERISK_SIP_PORT is not set"
-        fi
-
-        if [[ -n "$asterisk_sips_port" ]]; then
-            check_port_owner "${nv_mod} Asterisk SIPS" "$asterisk_sips_port" '(^| )asterisk( |$)' "asterisk"
-        else
-            warning "${nv_mod}: ASTERISK_SIPS_PORT is not set"
-        fi
-
+        check_nethvoice_listening_ports "$nv_mod"
         check_hairpin_nat_for_nethvoice "$nv_mod"
     done <<< "$nethvoice_modules"
 fi
