@@ -70,7 +70,6 @@ SATELLITE_RTP_PORT
 TANCREDIPORT
 POSTGRES_PORT
 REDIS_PORT
-RTP_PORT_MAX
 LDAP_PORT
 EOF
 )
@@ -155,12 +154,12 @@ get_whitelist_port_expected_service() {
         PHONEBOOK_LDAP_PORT) echo "MainThread" ;;
         PROXY_PORT) echo "kamailio" ;;
         REPORTS_API_PORT) echo "api" ;;
-        REPORTS_REDIS_PORT|POSTGRES_PORT|REDIS_PORT) echo "pasta.avx2" ;;
+        REPORTS_REDIS_PORT|POSTGRES_PORT|REDIS_PORT) echo "pasta.*" ;;
         REPORTS_UI_PORT) echo "rootlessport" ;;
         SATELLITE_HTTP_PORT|SATELLITE_RTP_PORT) echo "python" ;;
         SATELLITE_MQTT_PORT) echo "mosquitto" ;;
         SATELLITE_PGSQL_PORT) echo "postgres" ;;
-        RTP_PORT_MAX|LDAP_PORT) echo "slapd" ;;
+        LDAP_PORT) echo "slapd" ;;
         *) return 1 ;;
     esac
 }
@@ -178,12 +177,12 @@ get_whitelist_port_expected_regex() {
         PHONEBOOK_LDAP_PORT) echo '(^| )MainThread( |$)' ;;
         PROXY_PORT) echo '(^| )kamailio( |$)' ;;
         REPORTS_API_PORT) echo '(^| )api( |$)' ;;
-        REPORTS_REDIS_PORT|POSTGRES_PORT|REDIS_PORT) echo '(^| )pasta\.avx2( |$)' ;;
+        REPORTS_REDIS_PORT|POSTGRES_PORT|REDIS_PORT) echo '(^| )pasta\.[^ ]*( |$)' ;;
         REPORTS_UI_PORT) echo '(^| )rootlessport( |$)' ;;
         SATELLITE_HTTP_PORT|SATELLITE_RTP_PORT) echo '(^| )python( |$)' ;;
         SATELLITE_MQTT_PORT) echo '(^| )mosquitto( |$)' ;;
         SATELLITE_PGSQL_PORT) echo '(^| )postgres( |$)' ;;
-        RTP_PORT_MAX|LDAP_PORT) echo '(^| )slapd( |$)' ;;
+        LDAP_PORT) echo '(^| )slapd( |$)' ;;
         *) return 1 ;;
     esac
 }
