@@ -13,17 +13,25 @@ export PATH="$fixture_root/bin:$PATH"
 
 cat > "$fixture_root/bin/runagent" <<'MOCK'
 #!/bin/bash
-if [[ $# == 8 && $1 == -m && $3 == podman && $8 == 'pjsip show transports' ]]; then
-    printf 'Transport: fixture 0.0.0.0:15062\n'
-    exit 0
+# The FreePBX snapshot script runs locally against the asterisk mock.
+if [[ $1 == -m && $3 == podman && $4 == exec && $5 == freepbx && $6 == sh ]]; then
+    shift 5
+    exec "$@" </dev/null
 fi
-[[ $# == 4 && $1 == -m && $3 == printenv && $4 == AGENT_STATE_DIR ]] || exit 99
+# Module context: execution UID, then printenv AGENT_STATE_DIR output.
+[[ $# == 5 && $1 == -m && $3 == sh && $4 == -c && $5 == *'printenv AGENT_STATE_DIR'* ]] || exit 99
 # Lookups must not consume a module discovery loop's input.
 if IFS= read -r unexpected; then exit 98; fi
 printf '%s\n' "$2" >> "$FIXTURE_ROOT/runagent.calls"
 [[ -f "$FIXTURE_ROOT/runtime/$2.sleep" ]] && sleep 10
+printf '1001\n'
 cat -- "$FIXTURE_ROOT/runtime/$2.out" 2>/dev/null
-exit "$(cat "$FIXTURE_ROOT/runtime/$2.rc" 2>/dev/null || printf '1')"
+[[ "$(cat "$FIXTURE_ROOT/runtime/$2.rc" 2>/dev/null)" == 0 ]] || exit 3
+MOCK
+cat > "$fixture_root/bin/asterisk" <<'MOCK'
+#!/bin/bash
+[[ $# == 2 && $1 == -rx && $2 == 'pjsip show transports' ]] || exit 1
+printf 'Transport: fixture 0.0.0.0:15062\n'
 MOCK
 cat > "$fixture_root/bin/getent" <<'MOCK'
 #!/bin/bash
@@ -48,8 +56,8 @@ cat > "$fixture_root/bin/df" <<'MOCK'
 [[ $# == 3 && ($1 == -h || $1 == -P) && $2 == -- ]] || exit 99
 printf '%s|%s\n' "$1" "$3" >> "$FIXTURE_ROOT/df.calls"
 case "$3" in
-    "$FIXTURE_ROOT"/home/*) pct=89 ;;
-    "$FIXTURE_ROOT"/home2/*) pct=90 ;;
+    "$FIXTURE_ROOT"/home/*) pct=85 ;;
+    "$FIXTURE_ROOT"/home2/*) pct=95 ;;
     *) exit 1 ;;
 esac
 printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
@@ -65,6 +73,7 @@ chmod +x "$fixture_root/bin/"*
 
 # shellcheck source=sysanal3
 source "$repo_dir/sysanal3"
+RUNAGENT_TIMEOUT=2
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 assert_eq() { [[ "$1" == "$2" ]] || fail "$3 (expected '$2', got '$1')"; }
@@ -107,7 +116,7 @@ resolve_fail() {
 }
 
 # Exercise the same entry-point identity as bash <(curl ...), without main code.
-sed '/^# Argument parsing/,$d' "$repo_dir/sysanal3" > "$fixture_root/launch-prefix"
+sed '/^main "\$@"$/,$d' "$repo_dir/sysanal3" > "$fixture_root/launch-prefix"
 printf "printf 'process-substitution launch reaches main\\n'\n" >> "$fixture_root/launch-prefix"
 assert_eq "$(bash <(cat "$fixture_root/launch-prefix"))" 'process-substitution launch reaches main' 'normal launch source guard'
 
@@ -203,7 +212,7 @@ if [[ $EUID -eq 0 ]]; then
     setpriv --reuid=65534 --regid=65534 --clear-groups bash -c '
         source "$1/analyzer"
         timeout() { shift; "$@"; }
-        runagent() { printf "%s/unreadable\n" "$FIXTURE_ROOT"; }
+        runagent() { printf "1001\n%s/unreadable\n" "$FIXTURE_ROOT"; }
         getent() { return 2; }
         resolve_module_paths unreadable >/dev/null && exit 1
         resolve_module_paths unreadable >/dev/null && exit 1
@@ -298,10 +307,12 @@ runtime on-root '' 1
 resolve_ok on-root "$fixture_root/on-root/module/.config/state/environment"
 MODULES=$'conventional\noverride\nrelocated\nspaces\nmissing-file\non-root\nrootful'
 SILENT=1
+before=$WARNINGS
 report_module_home_filesystems > "$fixture_root/filesystems"
 assert_eq "$(wc -l < "$fixture_root/df.calls")" 4 'two df commands per unique non-root mount'
 assert_eq "$(grep -c '\[INFO\]' "$fixture_root/filesystems")" 2 'filesystem usage remains visible in silent mode'
-assert_eq "$PROBLEMS" 1 '90 percent flags a problem, 89 does not'
+assert_eq "$PROBLEMS" 1 '95 percent flags a problem'
+assert_eq "$WARNINGS" "$((before + 1))" '85 percent warns'
 assert_contains "$(cat "$fixture_root/filesystems")" "$fixture_root/home2 filesystem" 'relocated filesystem reported'
 [[ $(cat "$fixture_root/filesystems") != *'Root filesystem'* ]] || fail 'root report duplicated'
 assert_eq "${#PROBLEM_MSGS[@]}" "$PROBLEMS" 'filesystem problems counted in parent'

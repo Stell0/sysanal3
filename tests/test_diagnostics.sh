@@ -17,10 +17,10 @@ shift 2
 if IFS= read -r unexpected; then exit 98; fi
 printf '%s %s\n' "$mod" "$*" >> "$DIAGNOSTIC_FIXTURES/calls"
 case "$1" in
-    id)
-        [[ $# == 2 && $2 == -u ]] || exit 99
-        [[ -f "$DIAGNOSTIC_FIXTURES/$mod.uid" ]] || exit 1
-        cat "$DIAGNOSTIC_FIXTURES/$mod.uid"
+    sh)
+        # Module-context scripts run locally against the mocked tools below.
+        export MOCK_MODULE="$mod" AGENT_STATE_DIR=/state
+        exec "$@"
         ;;
     systemctl)
         if [[ "$mod" == rootful ]]; then
@@ -28,53 +28,92 @@ case "$1" in
         else
             [[ "$2" == --user ]] || exit 99
         fi
+        [[ "$*" == *ActiveEnterTimestampMonotonic* ]] || exit 99
         [[ -f "$DIAGNOSTIC_FIXTURES/$mod.services" ]] || exit 1
         cat "$DIAGNOSTIC_FIXTURES/$mod.services"
         ;;
     podman)
-        case "$2" in
-            ps)
-                [[ "$*" == 'podman ps -a --format {{.ID}}|{{.Names}}' ]] || exit 99
-                [[ -f "$DIAGNOSTIC_FIXTURES/$mod.ids" ]] || exit 1
-                cat "$DIAGNOSTIC_FIXTURES/$mod.ids"
-                ;;
-            inspect)
-                [[ "$3" == --format && "$4" == *'.RestartCount'* && "$4" == *'.State.Healthcheck.Status'* && "$5" == -- ]] || exit 99
-                [[ "$4" != *'.Config'* ]] || exit 99
-                [[ -f "$DIAGNOSTIC_FIXTURES/$mod.containers" ]] || exit 1
-                cat "$DIAGNOSTIC_FIXTURES/$mod.containers"
-                ;;
-            exec)
-                [[ "$3" == freepbx ]] || exit 99
-                if [[ "$4" == sh ]]; then
-                    shift 3
-                    exec "$@"
-                fi
-                [[ "$4" == asterisk && "$5" == -rx ]] || exit 99
-                case "$6" in
-                    'core show version') stage=version ;;
-                    'core show uptime seconds') stage=uptime ;;
-                    'core show channels count') stage=channels ;;
-                    *) exit 99 ;;
-                esac
-                [[ -f "$DIAGNOSTIC_FIXTURES/$stage" ]] || exit 1
-                cat "$DIAGNOSTIC_FIXTURES/$stage"
-                ;;
-        esac
+        [[ "$2" == exec && "$3" == freepbx && "$4" == sh ]] || exit 99
+        shift 3
+        exec "$@"
+        ;;
+    *) exit 99 ;;
+esac
+MOCK
+cat > "$fixture_root/bin/id" <<'MOCK'
+#!/bin/bash
+[[ $# == 1 && $1 == -u && -f "$DIAGNOSTIC_FIXTURES/$MOCK_MODULE.uid" ]] || exit 1
+cat "$DIAGNOSTIC_FIXTURES/$MOCK_MODULE.uid"
+MOCK
+cat > "$fixture_root/bin/podman" <<'MOCK'
+#!/bin/bash
+printf '%s podman %s\n' "$MOCK_MODULE" "$*" >> "$DIAGNOSTIC_FIXTURES/calls"
+case "$1" in
+    ps)
+        [[ "$*" == 'ps -a --format {{.ID}}|{{.Names}}' ]] || exit 99
+        [[ -f "$DIAGNOSTIC_FIXTURES/$MOCK_MODULE.ids" ]] || exit 1
+        cat "$DIAGNOSTIC_FIXTURES/$MOCK_MODULE.ids"
+        ;;
+    inspect)
+        [[ "$2" == --format && "$3" == *'.RestartCount'* && "$3" == *'.State.Healthcheck.Status'* && "$4" == -- ]] || exit 99
+        [[ "$3" != *'.Config'* ]] || exit 99
+        [[ -f "$DIAGNOSTIC_FIXTURES/$MOCK_MODULE.containers" ]] || exit 1
+        cat "$DIAGNOSTIC_FIXTURES/$MOCK_MODULE.containers"
         ;;
     *) exit 99 ;;
 esac
 MOCK
 cat > "$fixture_root/bin/asterisk" <<'MOCK'
 #!/bin/bash
-[[ $# == 2 && $1 == -rx && $2 == 'pjsip show contacts' ]] || exit 99
-cat "$DIAGNOSTIC_FIXTURES/contacts"
-exit "$(cat "$DIAGNOSTIC_FIXTURES/contacts.rc")"
+[[ $# == 2 && $1 == -rx ]] || exit 99
+case "$2" in
+    'core show version') stage=version ;;
+    'core show uptime seconds') stage=uptime ;;
+    'core show channels count') stage=channels ;;
+    'pjsip show contacts') stage=contacts ;;
+    'pjsip show endpoints') stage=endpoints ;;
+    'pjsip show registrations') stage=registrations ;;
+    'core show channels concise') stage=concise ;;
+    *) exit 1 ;;
+esac
+[[ -f "$DIAGNOSTIC_FIXTURES/$stage" ]] || exit 1
+cat "$DIAGNOSTIC_FIXTURES/$stage"
+exit "$(cat "$DIAGNOSTIC_FIXTURES/$stage.rc" 2>/dev/null || printf '0')"
+MOCK
+cat > "$fixture_root/bin/systemctl" <<'MOCK'
+#!/bin/bash
+[[ "$*" == 'list-units --failed --no-legend --no-pager --plain' ]] || exit 99
+cat "$DIAGNOSTIC_FIXTURES/failed-units" 2>/dev/null
+MOCK
+# Redis keys are files: "<key with / as _>.<field>" or ".scan" pattern lists.
+cat > "$fixture_root/bin/redis-cli" <<'MOCK'
+#!/bin/bash
+[[ $1 == --raw ]] || exit 99
+shift
+redis="$DIAGNOSTIC_FIXTURES/redis"
+if [[ $# == 0 ]]; then
+    # Batch mode: one reply line per command read from stdin.
+    while read -r cmd key field; do
+        case "$cmd" in
+            HGET) cat "$redis/${key//\//_}.$field" 2>/dev/null; echo ;;
+            SISMEMBER) if [[ -f "$redis/${key//\//_}.$field" ]]; then echo 1; else echo 0; fi ;;
+            *) echo ;;
+        esac
+    done
+    exit 0
+fi
+case "$1" in
+    --scan) cat "$redis/${3//\//_}.scan" 2>/dev/null ;;
+    HGET) cat "$redis/${2//\//_}.$3" 2>/dev/null ;;
+    SISMEMBER) if [[ -f "$redis/${2//\//_}.$3" ]]; then echo 1; else echo 0; fi ;;
+    *) exit 99 ;;
+esac
 MOCK
 chmod +x "$fixture_root/bin/"*
 # shellcheck source=sysanal3
 source "$repo_dir/sysanal3"
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+monotonic_now_usec() { printf '200000000000\n'; }
 assert_eq() { [[ "$1" == "$2" ]] || fail "$3 (expected '$2', got '$1')"; }
 assert_contains() { [[ "$1" == *"$2"* ]] || fail "$3"; }
 reset_messages() { WARNINGS=0; PROBLEMS=0; WARNING_MSGS=(); PROBLEM_MSGS=(); }
@@ -148,7 +187,7 @@ DATA
 check_module_services rootful >> "$fixture_root/output"
 check_module_services rootful >> "$fixture_root/output"
 assert_eq "$WARNINGS" 0 'rootful system manager is used'
-assert_eq "$(grep -cx 'rootful id -u' "$fixture_root/calls")" 1 'execution UID is cached'
+assert_eq "$(grep -c '^rootful sh -c id -u' "$fixture_root/calls")" 1 'execution UID is cached'
 
 cat >> "$fixture_root/rootless.services" <<'DATA'
 
@@ -179,6 +218,24 @@ SubState=running
 NRestarts=20
 Result=success
 
+Id=old-burst.service
+Type=simple
+LoadState=loaded
+ActiveState=active
+SubState=running
+NRestarts=20
+Result=success
+ActiveEnterTimestampMonotonic=1000000
+
+Id=recent-burst.service
+Type=simple
+LoadState=loaded
+ActiveState=active
+SubState=running
+NRestarts=20
+Result=success
+ActiveEnterTimestampMonotonic=199000000000
+
 Id=failed-cleanup.service
 Type=oneshot
 LoadState=loaded
@@ -187,7 +244,10 @@ TriggeredBy=failed-cleanup.timer
 Result=timeout
 DATA
 check_module_services rootless >> "$fixture_root/output"
-assert_eq "$WARNINGS" 3 'enabled inactive daemon, historical restarts and unsuccessful last run warn'
+assert_eq "$WARNINGS" 4 'enabled inactive daemon, recent or undated restarts and unsuccessful last run warn'
+[[ "${WARNING_MSGS[*]}" != *old-burst* ]] || fail 'restart burst followed by a long stable period warns'
+assert_contains "${WARNING_MSGS[*]}" 'recent-burst.service has 20 automatic restarts since counter reset, last start 16m ago' 'recent restart burst warns with age'
+assert_eq "${MODULE_UNIT_ACTIVE[rootless|stopped.service]}" inactive 'unit states are cached for port checks'
 assert_eq "$PROBLEMS" 2 'failed unit and repeated automatic restarts are detected'
 assert_eq "${#WARNING_MSGS[@]}" "$WARNINGS" 'service warning counts stay in parent'
 assert_eq "${#PROBLEM_MSGS[@]}" "$PROBLEMS" 'service problem counts stay in parent'
@@ -260,29 +320,162 @@ SILENT=0
 printf 'Asterisk 18.26.3 built by IDENTIFIER_CANARY\n' > "$fixture_root/version"
 printf 'System uptime: 70000\nLast reload: 60000\n' > "$fixture_root/uptime"
 printf '2 active channels\n1 active call\n99 calls processed\n' > "$fixture_root/channels"
+forget_snapshot freepbx:rootless
 check_nethvoice_asterisk_runtime rootless >> "$fixture_root/output"
 assert_eq "$WARNINGS" 0 'Asterisk aggregate queries parse successfully'
 assert_contains "$(cat "$fixture_root/output")" 'active channels: 2, active calls: 1' 'aggregate calls and channels reported'
 printf 'malformed SECRET_CANARY\n' > "$fixture_root/channels"
+forget_snapshot freepbx:rootless
 check_nethvoice_asterisk_runtime rootless >> "$fixture_root/output"
 assert_eq "$WARNINGS" 1 'malformed aggregate data warns without disclosure'
 rm "$fixture_root/version"
+forget_snapshot freepbx:rootless
 check_nethvoice_asterisk_runtime rootless >> "$fixture_root/output"
 assert_eq "$WARNINGS" 2 'unavailable Asterisk is distinguished from zero calls'
 
 reset_messages
 printf 'Contact: SIP_IDENTITY_CANARY/sip:private-device\nObjects found: 12\n' > "$fixture_root/contacts"
 printf '0\n' > "$fixture_root/contacts.rc"
+forget_snapshot freepbx:rootless
 check_nethvoice_pjsip_contacts rootless >> "$fixture_root/output"
 assert_eq "$WARNINGS" 0 'PJSIP summary count is used instead of contact-row heuristics'
 assert_contains "$(cat "$fixture_root/output")" 'PJSIP contact objects: 12' 'contact count reported'
 printf 'Objects found: 0\n' > "$fixture_root/contacts"
+forget_snapshot freepbx:rootless
 check_nethvoice_pjsip_contacts rootless >> "$fixture_root/output"
 assert_eq "$WARNINGS" 1 'zero contacts while CLI is running warn'
 printf '1\n' > "$fixture_root/contacts.rc"
+forget_snapshot freepbx:rootless
 check_nethvoice_pjsip_contacts rootless >> "$fixture_root/output"
 assert_eq "$WARNINGS" 2 'failed CLI output is not treated as zero contacts'
 assert_contains "${WARNING_MSGS[-1]}" 'cannot retrieve' 'failure warning distinguishes unavailable CLI'
+
+# Endpoint, registration and channel data are reduced to counts in the container.
+reset_messages
+cat > "$fixture_root/endpoints" <<'DATA'
+ Endpoint:  <Endpoint/CID.....................................>  <State.....>  <Channels.>
+ Endpoint:  201/SIP_IDENTITY_CANARY                              Not in use    0 of inf
+ Endpoint:  202/202                                              Unavailable   0 of inf
+DATA
+cat > "$fixture_root/registrations" <<'DATA'
+ <Registration/ServerURI..............................>  <Auth..........>  <Status.......>
+ trunk1/sip:SIP_IDENTITY_CANARY.example.test             trunk1            Registered
+ trunk2/sip:provider.example.test                        trunk2            Rejected
+
+Objects found: 2
+DATA
+printf 'SIP/1!ctx!200!1!Up!Dial!x!CUSTOMER_CANARY!!!3!20000!b!u1\nSIP/2!ctx!201!1!Up!Dial!x!y!!!3!60!b!u2\n' > "$fixture_root/concise"
+forget_snapshot freepbx:rootless
+{
+    check_nethvoice_pjsip_endpoints rootless
+    check_nethvoice_trunk_registrations rootless
+    check_nethvoice_long_channels rootless
+} >> "$fixture_root/output"
+assert_contains "$(cat "$fixture_root/output")" 'PJSIP endpoints: 2 configured, 1 unavailable' 'endpoint header excluded from counts'
+assert_eq "$PROBLEMS" 1 'rejected registration is a problem'
+assert_contains "${PROBLEM_MSGS[0]}" '1 of 2 outbound SIP registration' 'registration counts reported'
+assert_eq "$WARNINGS" 1 'channel older than the limit warns'
+assert_contains "${WARNING_MSGS[0]}" '1 of 2 active channel' 'long channel count reported'
+
+# Restart reporting and failed system units.
+reset_messages
+printf 'cockpit.service loaded failed failed Cockpit\npromtail.service loaded failed failed Alloy\n' > "$fixture_root/failed-units"
+check_failed_system_services >> "$fixture_root/output"
+assert_eq "$PROBLEMS" 2 'each failed system unit is a separate problem'
+assert_contains "${PROBLEM_MSGS[1]}" 'promtail.service' 'failed unit name is in the summary message'
+
+# WireGuard peers are named by VPN address and judged by handshake age.
+reset_messages
+NODE_ID=1
+IS_LEADER=1
+NODE_VPN_IP=([1]=10.5.4.1 [2]=10.5.4.2 [3]=10.5.4.3 [4]=10.5.4.4 [5]=10.5.4.5)
+VPN_IP_NODE=([10.5.4.1]=1 [10.5.4.2]=2 [10.5.4.3]=3 [10.5.4.4]=4 [10.5.4.5]=5)
+wg_dump=$'PRIVATE_CANARY\tpub\t55820\toff\n'
+wg_dump+=$'peer2\t(none)\t192.0.2.2:55820\t10.5.4.2/32\t9940\t1\t1\t25\n'
+wg_dump+=$'peer3\t(none)\t(none)\t10.5.4.3/32\t0\t0\t0\t25\n'
+wg_dump+=$'peer4\t(none)\t192.0.2.4:55820\t10.5.4.4/32\t1000\t1\t1\t25\n'
+evaluate_wireguard_peers "$wg_dump" 10000 >> "$fixture_root/output"
+assert_eq "$PROBLEMS" 2 'never and stale handshakes are problems'
+assert_contains "${PROBLEM_MSGS[0]}" 'node 3 (10.5.4.3) never completed' 'peer named after its node'
+assert_contains "${PROBLEM_MSGS[1]}" 'node 4 (10.5.4.4) last WireGuard handshake 2h 30m ago' 'handshake age reported'
+assert_eq "$WARNINGS" 1 'registered node without a peer warns on the leader'
+assert_contains "${WARNING_MSGS[0]}" 'node 5 is registered' 'missing peer named'
+
+# Kamailio dispatcher destination flags.
+reset_messages
+dispatcher=$'\t\t\t\tDEST: {\n\t\t\t\t\tURI: sip:10.5.4.1:24005\n\t\t\t\t\tFLAGS: AX\n'
+dispatcher+=$'\t\t\t\tDEST: {\n\t\t\t\t\tURI: sip:10.5.4.2:24005\n\t\t\t\t\tFLAGS: IP\n'
+evaluate_dispatcher_destinations proxy "$dispatcher" >> "$fixture_root/output"
+assert_eq "$PROBLEMS" 1 'inactive dispatcher destination is a problem'
+assert_contains "${PROBLEM_MSGS[0]}" 'sip:10.5.4.2:24005 is inactive' 'inactive destination named'
+evaluate_dispatcher_destinations proxy '' >> "$fixture_root/output"
+assert_eq "$WARNINGS" 1 'empty dispatcher warns'
+
+# Backup coverage, failures, stale references and opt-out flags.
+reset_messages
+redis="$fixture_root/redis"
+mkdir -p "$redis"
+printf 'cluster/backup/1\ncluster/backup/2\ncluster/backup/3\ncluster/backup/4\n' > "$redis/cluster_backup_*.scan"
+backup_fixture() {
+    printf '%s' "$2" > "$redis/cluster_backup_$1.name"
+    printf '%s' "$3" > "$redis/cluster_backup_$1.enabled"
+    printf '%s' "$4" > "$redis/cluster_backup_$1.instances"
+    printf '{"interval": "daily"}' > "$redis/cluster_backup_$1.schedule_hint"
+}
+backup_fixture 1 Daily 1 'mod1 removed9'
+backup_fixture 2 Second 1 mod2
+backup_fixture 3 Paused '' mod3
+backup_fixture 4 Empty 1 removed8
+now=$(date +%s)
+printf '{"start": %s, "end": %s, "errors": 0}' $((now - 3700)) $((now - 3600)) > "$redis/node_1_backup_status_1.mod1"
+printf '{"start": %s, "end": %s, "errors": 2}' $((now - 3700)) $((now - 3600)) > "$redis/node_1_backup_status_2.mod2"
+touch "$redis/module_mod4_flags.no_data_backup"
+CLUSTER_MODULE_NODE=([mod1]=1 [mod2]=1 [mod3]=1 [mod4]=1 [nethvoice5]=2)
+MODULES=$'mod1\nmod2\nmod3\nmod4'
+check_backups >> "$fixture_root/output"
+assert_eq "$PROBLEMS" 1 'failed backup run is a problem'
+assert_contains "${PROBLEM_MSGS[0]}" "mod2: backup 'Second' (id 2): last run failed with 2 error(s)" 'failed backup named'
+assert_eq "$WARNINGS" 4 'stale references, empty enabled backup and uncovered module warn'
+assert_contains "${WARNING_MSGS[*]}" "mod3: not included in any enabled backup (only in disabled 'Paused')" 'disabled-only coverage warns'
+assert_contains "${WARNING_MSGS[*]}" "Backup 'Empty' (id 4) is enabled but includes no installed module" 'empty enabled backup warns'
+[[ "${WARNING_MSGS[*]}" != *mod4* ]] || fail 'no_data_backup module warned'
+printf '{"start": 1, "end": 2, "errors": 0}' > "$redis/node_1_backup_status_1.mod1"
+reset_messages
+check_backups >> "$fixture_root/output"
+assert_contains "${WARNING_MSGS[*]}" "mod1: backup 'Daily' (id 1): last run completed" 'overdue backup warns'
+
+# Leftover homes are module-like names with NS8 state and no cluster module.
+reset_messages
+mkdir -p "$fixture_root/homes/orphan12/.config/state" "$fixture_root/homes/nethvoice5/.config/state" \
+    "$fixture_root/homes/admin/.config/state" "$fixture_root/homes/plain3"
+check_orphan_module_homes "$fixture_root/homes" >> "$fixture_root/output"
+assert_eq "$WARNINGS" 1 'only the removed module home warns'
+assert_contains "${WARNING_MSGS[0]}" "$fixture_root/homes/orphan12" 'leftover home path reported'
+
+# Background queries keep exact output bytes and the command status.
+mkdir "$fixture_root/bg"
+BG_DIR="$fixture_root/bg"
+start_query sample printf 'value\n\n'
+start_query failing sh -c 'printf partial; exit 3'
+fetch_query sample || fail 'started query is not available'
+assert_eq "$QUERY_OUTPUT" $'value\n\n' 'trailing newlines preserved'
+assert_eq "$QUERY_RC" 0 'successful query status'
+fetch_query failing || fail 'failed query is not available'
+assert_eq "$QUERY_OUTPUT|$QUERY_RC" 'partial|3' 'failed query output and status'
+if fetch_query never-started; then fail 'unknown query reported as available'; fi
+BG_DIR=""
+
+# Helpers for sizes and JSON output.
+assert_eq "$(size_to_bytes '15.71GB (89%)')" 15710000000 'Podman sizes are parsed'
+assert_eq "$(json_string $'a"b\\c\nd\001')" '"a\"b\\c\nd"' 'JSON strings are escaped'
+reset_messages
+problem 'one "quoted"' > /dev/null
+warning 'two' > /dev/null
+json=$(print_json_report)
+assert_contains "$json" '"problems":["one \"quoted\""],"warnings":["two"]' 'JSON report lists messages'
+if command -v jq >/dev/null 2>&1; then
+    jq -e '.problem_count == 1 and .warning_count == 1' <<< "$json" >/dev/null || fail 'JSON report is not valid JSON'
+fi
 
 # Proxy route validation uses the configured node-local address, including IPv6.
 reset_messages
@@ -335,7 +528,7 @@ touch "$fixture_root/udp-listener"
 check_port_owner 'split SIP UDP' 24005 '(^| )asterisk( |$)' asterisk udp >> "$fixture_root/output"
 assert_eq "$PROBLEMS" 1 'actual UDP listener passes'
 
-if grep -Eq 'SECRET_CANARY|IDENTIFIER_CANARY|SIP_IDENTITY_CANARY' "$fixture_root/output" "$fixture_root/memory-output"; then
+if grep -Eq 'SECRET_CANARY|IDENTIFIER_CANARY|SIP_IDENTITY_CANARY|CUSTOMER_CANARY|PRIVATE_CANARY' "$fixture_root/output" "$fixture_root/memory-output"; then
     fail 'raw command metadata or contact identities disclosed'
 fi
-printf 'PASS: service contexts, conditional units, container health, memory, Asterisk aggregates, proxy addresses\n'
+printf 'PASS: service contexts, restart recency, container health, memory, Asterisk aggregates, cluster VPN, backups, leftovers, proxy, JSON\n'

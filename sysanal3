@@ -100,10 +100,9 @@ resolve_module_paths() {
     fi
     MODULE_PATH_STATUS["$mod"]=1
 
-    # A sentinel preserves trailing newlines so extra blank lines are rejected.
-    if state_dir=$(timeout 5s runagent -m "$mod" printenv AGENT_STATE_DIR </dev/null 2>/dev/null
-        lookup_rc=$?; printf '.'; exit "$lookup_rc"); then
-        state_dir="${state_dir%.}"
+    query_module_context "$mod"
+    if [[ "${MODULE_CONTEXT_STATUS[$mod]}" == 0 ]]; then
+        state_dir="${MODULE_STATE_DIR_OUTPUT[$mod]}"
         state_dir="${state_dir%$'\n'}"
         if is_absolute_single_path "$state_dir"; then
             runtime_reason=""
@@ -162,7 +161,7 @@ resolve_local_module_paths() {
 }
 
 report_module_home_filesystems() {
-    local mod module_home target root_target usage pct
+    local mod module_home target root_target usage reported=0
     local -A reported_targets=([/]=1)
     root_target=$(findmnt -n -o TARGET --target / 2>/dev/null) || root_target="/"
     [[ -n "$root_target" ]] && reported_targets["$root_target"]=1
@@ -174,13 +173,14 @@ report_module_home_filesystems() {
         target=$(findmnt -n -o TARGET --target "$module_home" 2>/dev/null) || continue
         [[ -z "$target" || -n "${reported_targets[$target]+reported}" ]] && continue
         reported_targets["$target"]=1
+        ((reported++))
         usage=$(df -h -- "$module_home" 2>/dev/null | awk 'NR==2{printf "%s used / %s total (%s full)", $3, $2, $5}')
         info_always "${target} filesystem (module homes): ${usage:-N/A}"
-        pct=$(df -P -- "$module_home" 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}')
-        if [[ "$pct" =~ ^[0-9]+$ ]] && (( pct >= 90 )); then
-            problem "${target} filesystem usage at ${pct}% (>= 90%)"
-        fi
+        check_filesystem_usage "${target} filesystem" "$module_home"
     done <<< "$MODULES"
+    if (( reported == 0 )); then
+        info "All module homes are on the root filesystem"
+    fi
     return 0
 }
 
@@ -190,53 +190,143 @@ LOCAL_VPN_ADDRESS=""
 NETHVOICE_PROXY_MODULE_COUNT=0
 NETHVOICE_PROXY_ROUTE_COUNT=0
 
+# Background queries: slow read-only commands (runagent start-up costs seconds
+# on loaded nodes) run in parallel and are consumed later by name. Without a
+# work directory, or for names never started, consumers run inline.
+BG_DIR=""
+MAX_PARALLEL_QUERIES=8
+declare -A BG_PIDS=()
+QUERY_OUTPUT=""
+QUERY_RC=""
+
+start_query() {
+    local name="$1"
+    shift
+    [[ -n "$BG_DIR" ]] || return 1
+    while (( $(jobs -rp | wc -l) >= MAX_PARALLEL_QUERIES )); do
+        wait -n 2>/dev/null || break
+    done
+    ( "$@" > "$BG_DIR/$name" 2>/dev/null </dev/null; echo $? > "$BG_DIR/$name.rc" ) </dev/null &
+    BG_PIDS["$name"]=$!
+}
+
+# Wait for a started query; sets QUERY_OUTPUT (exact bytes) and QUERY_RC.
+fetch_query() {
+    local name="$1"
+    [[ -n "$BG_DIR" ]] || return 1
+    if [[ -n "${BG_PIDS[$name]:-}" ]]; then
+        wait "${BG_PIDS[$name]}" 2>/dev/null
+        unset 'BG_PIDS[$name]'
+    fi
+    [[ -f "$BG_DIR/$name.rc" ]] || return 1
+    QUERY_OUTPUT=$(cat -- "$BG_DIR/$name"; printf '.')
+    QUERY_OUTPUT="${QUERY_OUTPUT%.}"
+    QUERY_RC=$(cat -- "$BG_DIR/$name.rc")
+    return 0
+}
+
+# Single-line-reply Redis commands, one per stdin line, in one redis-cli
+# process: on NS8 redis-cli itself starts through runagent. Prints one line
+# per command (empty for nil).
+redis_batch() {
+    redis-cli --raw 2>/dev/null
+}
+
 # Discover the module execution UID, rather than assuming every module is rootless.
 declare -A MODULE_RUNTIME_UIDS=()
 declare -A MODULE_RUNTIME_STATUS=()
+declare -A MODULE_CONTEXT_STATUS=()
+declare -A MODULE_STATE_DIR_OUTPUT=()
+# Active state of module units, keyed by "<module>|<unit>", for later checks.
+declare -A MODULE_UNIT_ACTIVE=()
+
+# One runagent call yields the execution UID and AGENT_STATE_DIR: runagent
+# start-up costs seconds on loaded nodes. Status 3 means only the UID is known.
+module_context_command() {
+    # shellcheck disable=SC2016
+    timeout "${RUNAGENT_TIMEOUT}s" runagent -m "$1" sh -c 'id -u || exit 1; printenv AGENT_STATE_DIR || exit 3' </dev/null 2>/dev/null
+}
+
+query_module_context() {
+    local mod="$1" output rc uid
+    [[ -n "${MODULE_CONTEXT_STATUS[$mod]+cached}" ]] && return 0
+    if fetch_query "context.$mod"; then
+        output="$QUERY_OUTPUT"
+        rc="$QUERY_RC"
+    else
+        # A sentinel preserves trailing newlines so extra blank lines are rejected.
+        output=$(module_context_command "$mod"; rc=$?; printf '.'; exit "$rc")
+        rc=$?
+        output="${output%.}"
+    fi
+    uid="${output%%$'\n'*}"
+    if [[ ( "$rc" == 0 || "$rc" == 3 ) && "$output" == *$'\n'* && "$uid" =~ ^[0-9]+$ ]]; then
+        MODULE_RUNTIME_UIDS["$mod"]="$uid"
+    fi
+    if [[ "$rc" == 0 ]]; then
+        MODULE_CONTEXT_STATUS["$mod"]=0
+        MODULE_STATE_DIR_OUTPUT["$mod"]="${output#*$'\n'}"
+    else
+        MODULE_CONTEXT_STATUS["$mod"]="$rc"
+    fi
+    return 0
+}
 
 resolve_module_runtime() {
-    local mod="$1" runtime_uid
+    local mod="$1"
     if [[ -n "${MODULE_RUNTIME_STATUS[$mod]+cached}" ]]; then
         return "${MODULE_RUNTIME_STATUS[$mod]}"
     fi
-    MODULE_RUNTIME_STATUS["$mod"]=1
-    if runtime_uid=$(timeout 5s runagent -m "$mod" id -u </dev/null 2>/dev/null) &&
-        [[ "$runtime_uid" =~ ^[0-9]+$ ]]; then
-        MODULE_RUNTIME_UIDS["$mod"]="$runtime_uid"
+    query_module_context "$mod"
+    if [[ -n "${MODULE_RUNTIME_UIDS[$mod]:-}" ]]; then
         MODULE_RUNTIME_STATUS["$mod"]=0
         return 0
     fi
+    MODULE_RUNTIME_STATUS["$mod"]=1
     warning "${mod}: cannot determine module execution UID; container and service checks skipped"
     return 1
 }
 
-check_module_services() {
-    local mod="$1" service_output line key value
+module_services_command() {
+    local mod="$1"
     local -a manager_args=() unit_args=()
-    local -A properties=()
-    resolve_module_runtime "$mod" || return 0
     if [[ "${MODULE_RUNTIME_UIDS[$mod]}" == 0 ]]; then
         # Only module-owned system units; do not inspect the whole host per module.
         unit_args=("${mod}.service" "${mod}-*.service")
     else
         manager_args=(--user)
     fi
-    if ! service_output=$(timeout 15s runagent -m "$mod" systemctl "${manager_args[@]}" show \
+    timeout "${RUNAGENT_TIMEOUT}s" runagent -m "$mod" systemctl "${manager_args[@]}" show \
         --all --type=service --no-pager \
-        --property=Id,Type,LoadState,ActiveState,SubState,UnitFileState,Result,NRestarts,TriggeredBy,ConditionResult \
-        "${unit_args[@]}" </dev/null 2>/dev/null); then
+        --property=Id,Type,LoadState,ActiveState,SubState,UnitFileState,Result,NRestarts,TriggeredBy,ConditionResult,ActiveEnterTimestampMonotonic \
+        "${unit_args[@]}" </dev/null 2>/dev/null
+}
+
+check_module_services() {
+    local mod="$1" service_output line key value now_usec rc
+    local -A properties=()
+    resolve_module_runtime "$mod" || return 0
+    if fetch_query "services.$mod"; then
+        service_output="$QUERY_OUTPUT"
+        rc="$QUERY_RC"
+    else
+        service_output=$(module_services_command "$mod")
+        rc=$?
+    fi
+    if [[ "$rc" != 0 ]]; then
         warning "${mod}: cannot query module services"
         return 0
     fi
+    now_usec=$(monotonic_now_usec)
     # systemctl show returns property blocks separated by blank lines.
     while IFS= read -r line; do
         if [[ -z "$line" ]]; then
-            report_module_service_state "$mod" properties
+            report_module_service_state "$mod" properties "$now_usec"
             properties=()
         elif [[ "$line" == *=* ]]; then
             key="${line%%=*}"; value="${line#*=}"
             case "$key" in
-                Id|Type|LoadState|ActiveState|SubState|UnitFileState|Result|NRestarts|TriggeredBy|ConditionResult)
+                Id|Type|LoadState|ActiveState|SubState|UnitFileState|Result|NRestarts|TriggeredBy|ConditionResult|ActiveEnterTimestampMonotonic)
                     # Read through the nameref in report_module_service_state.
                     # shellcheck disable=SC2034
                     properties["$key"]="$value" ;;
@@ -246,11 +336,31 @@ check_module_services() {
     return 0
 }
 
+# CLOCK_MONOTONIC in microseconds, comparable with systemd *Monotonic stamps.
+monotonic_now_usec() {
+    awk '{ printf "%d\n", $1 * 1000000 }' /proc/uptime 2>/dev/null
+}
+
+format_duration() {
+    local seconds="$1"
+    if (( seconds >= 86400 )); then
+        printf '%dd %dh' $((seconds / 86400)) $((seconds % 86400 / 3600))
+    elif (( seconds >= 3600 )); then
+        printf '%dh %dm' $((seconds / 3600)) $((seconds % 3600 / 60))
+    elif (( seconds >= 60 )); then
+        printf '%dm' $((seconds / 60))
+    else
+        printf '%ds' "$seconds"
+    fi
+}
+
 report_module_service_state() {
-    local mod="$1"
+    local mod="$1" now_usec="${3:-}"
     local -n service_props="$2"
     local unit="${service_props[Id]:-}" restarts="${service_props[NRestarts]:-}"
+    local started="${service_props[ActiveEnterTimestampMonotonic]:-}" age=""
     [[ -z "$unit" || "${service_props[LoadState]:-}" != loaded ]] && return 0
+    MODULE_UNIT_ACTIVE["$mod|$unit"]="${service_props[ActiveState]:-}"
     if [[ "${service_props[ActiveState]:-}" == failed ]]; then
         problem "${mod}: service ${unit} is failed"
     elif [[ "${service_props[ActiveState]:-}" == inactive &&
@@ -266,6 +376,10 @@ report_module_service_state() {
                 warning "${mod}: service ${unit} last run ended with ${service_props[Result]}" ;;
         esac
     fi
+    # Seconds since the unit last became active; restarts reset this stamp.
+    if [[ "$started" =~ ^[1-9][0-9]*$ && "$now_usec" =~ ^[0-9]+$ ]] && (( now_usec >= started )); then
+        age=$(( (now_usec - started) / 1000000 ))
+    fi
     if [[ "${service_props[SubState]:-}" == auto-restart ]]; then
         if [[ "$restarts" =~ ^[0-9]+$ ]] && (( restarts > RESTART_THRESHOLD )); then
             problem "${mod}: service ${unit} is repeatedly restarting (${restarts} automatic restarts)"
@@ -273,40 +387,81 @@ report_module_service_state() {
             warning "${mod}: service ${unit} is waiting for automatic restart"
         fi
     elif [[ "$restarts" =~ ^[0-9]+$ ]] && (( restarts > RESTART_THRESHOLD )); then
-        warning "${mod}: service ${unit} has ${restarts} automatic restarts since counter reset; check recent logs (threshold: ${RESTART_THRESHOLD})"
+        if [[ -n "$age" ]] && (( age > RESTART_RECENT_SECONDS )); then
+            # Old bursts, e.g. agents waiting for Redis during a core update.
+            info "${mod}: service ${unit} has ${restarts} historical automatic restarts; stable for $(format_duration "$age")"
+        else
+            warning "${mod}: service ${unit} has ${restarts} automatic restarts since counter reset${age:+, last start $(format_duration "$age") ago}; check recent logs (threshold: ${RESTART_THRESHOLD})"
+        fi
     fi
     return 0
 }
 
-check_module_containers() {
-    local mod="$1" container_ids container_output id name state restarts oom health extra
-    local -a ids=()
+# Runs in the module context: list containers, then inspect selected fields
+# of module-owned ones. Rootful Podman is shared with the host, so NS8-owned
+# containers are selected by the module ID or its hyphen-prefixed names.
+CONTAINER_QUERY_SCRIPT=$(cat <<'EOF'
+inventory=$(podman ps -a --format '{{.ID}}|{{.Names}}') || exit 1
+printf '%s\n' "$inventory"
+ids=$(printf '%s\n' "$inventory" | while IFS='|' read -r id name; do
+    [ -n "$id" ] || continue
+    if [ "$3" = 1 ]; then
+        case "$name" in "$2"|"$2"-*) ;; *) continue ;; esac
+    fi
+    printf '%s\n' "$id"
+done)
+[ -n "$ids" ] || exit 0
+printf '@@inspect\n'
+podman inspect --format "$1" -- $ids || exit 2
+EOF
+)
+
+module_containers_command() {
+    local mod="$1" rootful=0
     local format='{{.Name}}|{{.State.Status}}|{{.RestartCount}}|{{.State.OOMKilled}}|{{if .State.Healthcheck}}{{.State.Healthcheck.Status}}{{end}}'
+    [[ "${MODULE_RUNTIME_UIDS[$mod]}" == 0 ]] && rootful=1
+    # Inspect selected fields only: full inspect output contains environment secrets.
+    timeout "${RUNAGENT_TIMEOUT}s" runagent -m "$mod" sh -c "$CONTAINER_QUERY_SCRIPT" sh "$format" "$mod" "$rootful" </dev/null 2>/dev/null
+}
+
+check_module_containers() {
+    local mod="$1" output rc id name state restarts oom health extra line
+    local inventory="" inspect="" in_inspect=0
     resolve_module_runtime "$mod" || return 0
-    if ! container_ids=$(timeout 15s runagent -m "$mod" podman ps -a --format '{{.ID}}|{{.Names}}' </dev/null 2>/dev/null); then
+    if fetch_query "containers.$mod"; then
+        output="$QUERY_OUTPUT"
+        rc="$QUERY_RC"
+    else
+        output=$(module_containers_command "$mod")
+        rc=$?
+    fi
+    while IFS= read -r line; do
+        if [[ "$line" == '@@inspect' ]]; then
+            in_inspect=1
+        elif (( in_inspect )); then
+            inspect+="$line"$'\n'
+        else
+            inventory+="$line"$'\n'
+        fi
+    done <<< "$output"
+    if [[ "$rc" != 0 ]] && (( ! in_inspect )); then
         warning "${mod}: cannot list module containers"
         return 0
     fi
-    [[ -z "$container_ids" ]] && return 0
     while IFS='|' read -r id name extra; do
+        [[ -z "$id$name$extra" ]] && continue
         [[ "$id" =~ ^[a-f0-9]{12,64}$ && "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ && -z "$extra" ]] || {
             warning "${mod}: invalid container inventory; container checks skipped"
             return 0
         }
-        if [[ "${MODULE_RUNTIME_UIDS[$mod]}" == 0 ]]; then
-            # Rootful Podman is shared with the host. NS8-owned containers use
-            # the module ID or its hyphen-prefixed component names.
-            [[ "$name" == "$mod" || "$name" == "$mod-"* ]] || continue
-        fi
-        ids+=("$id")
-    done <<< "$container_ids"
-    [[ ${#ids[@]} -eq 0 ]] && return 0
-    # Inspect selected fields only: full inspect output contains environment secrets.
-    if ! container_output=$(timeout 15s runagent -m "$mod" podman inspect --format "$format" -- "${ids[@]}" </dev/null 2>/dev/null); then
+    done <<< "$inventory"
+    (( in_inspect )) || return 0
+    if [[ "$rc" != 0 ]]; then
         warning "${mod}: cannot inspect module container health"
         return 0
     fi
     while IFS='|' read -r name state restarts oom health extra; do
+        [[ -z "$name$state$restarts$oom$health$extra" ]] && continue
         name="${name#/}"
         if [[ ! "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ || ! "$restarts" =~ ^[0-9]+$ ||
             ! "$oom" =~ ^(true|false)$ || -n "$extra" ||
@@ -325,7 +480,7 @@ check_module_containers() {
         fi
         [[ "$oom" == true ]] && problem "${mod}: container ${name} was killed due to memory exhaustion (OOM)"
         [[ "$health" == unhealthy ]] && problem "${mod}: container ${name} is unhealthy"
-    done <<< "$container_output"
+    done <<< "$inspect"
     return 0
 }
 
@@ -359,16 +514,210 @@ check_node_memory() {
     return 0
 }
 
+# Container snapshots run many read-only commands in one runagent/podman exec.
+# Each section starts with "<marker> <name> <exit-status>"; the random marker
+# cannot be forged by command output we did not expect.
+SNAPSHOT_PRELUDE=$(cat <<'EOF'
+marker=$1
+shift
+section() {
+    name=$1
+    shift
+    out=$("$@" 2>/dev/null)
+    rc=$?
+    printf '%s %s %s\n' "$marker" "$name" "$rc"
+    [ -z "$out" ] || printf '%s\n' "$out"
+}
+section_with_errors() {
+    name=$1
+    shift
+    out=$("$@" 2>&1)
+    rc=$?
+    printf '%s %s %s\n' "$marker" "$name" "$rc"
+    [ -z "$out" ] || printf '%s\n' "$out"
+}
+EOF
+)
+
+# Contacts, endpoints, registrations and channels are reduced to counts inside
+# the container so URIs, caller IDs and device identities are never collected.
+FREEPBX_SNAPSHOT_SCRIPT=$(cat <<'EOF'
+channel_max_age=$1
+rx() { asterisk -rx "$1"; }
+contacts() {
+    out=$(asterisk -rx 'pjsip show contacts') || return 1
+    printf '%s\n' "$out" | sed -nE 's/^Objects found: *([0-9]+) *$/\1/p'
+}
+endpoints() {
+    out=$(asterisk -rx 'pjsip show endpoints') || return 1
+    printf '%s\n' "$out" | awk '/^ *Endpoint: / && !/</ { total++; if ($0 ~ /Unavailable/) unavailable++ }
+        END { print total+0, unavailable+0 }'
+}
+registrations() {
+    out=$(asterisk -rx 'pjsip show registrations') || return 1
+    printf '%s\n' "$out" | awk '
+        /^Objects found: *[0-9]+/ { total = $3 }
+        !/</ && /[[:space:]](Rejected|Unregistered|Stopped)([[:space:]]|$)/ { failed++ }
+        END { print total+0, failed+0 }'
+}
+long_channels() {
+    out=$(asterisk -rx 'core show channels concise') || return 1
+    printf '%s\n' "$out" | awk -F'!' -v max="$channel_max_age" '
+        NF >= 12 { total++; if ($12 + 0 > max) long++ }
+        END { print total+0, long+0 }'
+}
+cidname() {
+    out=$(asterisk -rx 'database show AMPUSER') || return 1
+    printf '%s\n' "$out" | sed -nE 's/^[[:space:]]*(\/AMPUSER\/\/cidname[[:space:]]*:.*)$/\1/p'
+}
+smtp_from() { if [ -n "${SMTP_FROM_ADDRESS:-}" ]; then echo 1; else echo 0; fi; }
+mailcmd_from() {
+    if grep -E '^[[:space:]]*mailcmd[[:space:]]*=' /etc/asterisk/voicemail.conf 2>/dev/null | grep -qF -- 'send_email -f '; then
+        echo 1
+    else
+        echo 0
+    fi
+}
+section version rx 'core show version'
+section uptime rx 'core show uptime seconds'
+section channels rx 'core show channels count'
+section contacts contacts
+section endpoints endpoints
+section registrations registrations
+section long_channels long_channels
+section cidname cidname
+section cf rx 'database show CF'
+section queues rx 'queue show'
+section transports rx 'pjsip show transports'
+section smtp_from smtp_from
+section mailcmd_from mailcmd_from
+EOF
+)
+
+# Credentials stay in the container and are passed through MYSQL_PWD, never argv.
+MARIADB_SNAPSHOT_SCRIPT=$(cat <<'EOF'
+MYSQL_PWD=${MARIADB_ROOT_PASSWORD:-}
+export MYSQL_PWD
+section_with_errors mysqlcheck mysqlcheck -uroot -A
+section localnets mysql -uroot -N -B asterisk -e "SELECT \`key\`, val, type, id FROM kvstore_Sipsettings WHERE \`key\` = 'localnets';"
+section need_reload mysql -uroot -N -B asterisk -e "SELECT value FROM admin WHERE variable = 'need_reload';"
+EOF
+)
+
+PROXY_SNAPSHOT_SCRIPT=$(cat <<'EOF'
+section dispatcher podman exec kamailio kamcmd dispatcher.list
+section rtpengine podman exec rtpengine rtpengine-ctl list numsessions
+EOF
+)
+
+declare -A SNAPSHOT_STATUS=()
+declare -A SNAPSHOT_OUTPUT=()
+declare -A SNAPSHOT_RC=()
+
+# Parse snapshot output into SNAPSHOT_OUTPUT/SNAPSHOT_RC keyed "<id>|<section>".
+store_snapshot() {
+    local id="$1" marker="$2" output="$3" line name rc current=""
+    SNAPSHOT_STATUS["$id"]=1
+    while IFS= read -r line; do
+        if [[ "$line" == "$marker "* ]]; then
+            read -r _ name rc <<< "$line"
+            current="$id|$name"
+            SNAPSHOT_RC["$current"]="$rc"
+            SNAPSHOT_OUTPUT["$current"]=""
+            SNAPSHOT_STATUS["$id"]=0
+        elif [[ -n "$current" ]]; then
+            SNAPSHOT_OUTPUT["$current"]+="$line"$'\n'
+        fi
+    done <<< "$output"
+    return "${SNAPSHOT_STATUS[$id]}"
+}
+
+new_snapshot_marker() {
+    printf '@@sysanal3-%s%s%s\n' "$RANDOM" "$RANDOM" "$RANDOM"
+}
+
+declare -A SNAPSHOT_MARKERS=()
+
+freepbx_snapshot_command() {
+    timeout 90s runagent -m "$1" podman exec freepbx sh -c "${SNAPSHOT_PRELUDE}"$'\n'"${FREEPBX_SNAPSHOT_SCRIPT}" \
+        sh "$2" "$NV_CHANNEL_MAX_AGE" </dev/null 2>/dev/null
+}
+
+mariadb_snapshot_command() {
+    # mysqlcheck reads every table; it is slow on large CDR databases by design.
+    timeout 1800s runagent -m "$1" podman exec mariadb sh -c "${SNAPSHOT_PRELUDE}"$'\n'"${MARIADB_SNAPSHOT_SCRIPT}" \
+        sh "$2" </dev/null 2>/dev/null
+}
+
+proxy_snapshot_command() {
+    timeout "${RUNAGENT_TIMEOUT}s" runagent -m "$1" sh -c "${SNAPSHOT_PRELUDE}"$'\n'"${PROXY_SNAPSHOT_SCRIPT}" \
+        sh "$2" </dev/null 2>/dev/null
+}
+
+# Start a snapshot in the background; collect_snapshot consumes it later.
+prefetch_snapshot() {
+    local kind="$1" mod="$2" marker
+    marker=$(new_snapshot_marker)
+    SNAPSHOT_MARKERS["$kind:$mod"]="$marker"
+    start_query "snapshot.$kind.$mod" "${kind}_snapshot_command" "$mod" "$marker"
+}
+
+# Collect once per run (prefetched or inline); forget_snapshot forces a new one.
+collect_snapshot() {
+    local kind="$1" mod="$2" id="$1:$2" marker output
+    [[ -n "${SNAPSHOT_STATUS[$id]+cached}" ]] && return "${SNAPSHOT_STATUS[$id]}"
+    marker="${SNAPSHOT_MARKERS[$id]:-}"
+    if [[ -n "$marker" ]] && fetch_query "snapshot.$kind.$mod"; then
+        output="$QUERY_OUTPUT"
+    else
+        marker=$(new_snapshot_marker)
+        output=$("${kind}_snapshot_command" "$mod" "$marker")
+    fi
+    store_snapshot "$id" "$marker" "$output"
+}
+
+collect_freepbx_snapshot() { collect_snapshot freepbx "$1"; }
+collect_mariadb_snapshot() { collect_snapshot mariadb "$1"; }
+collect_proxy_snapshot() { collect_snapshot proxy "$1"; }
+
+forget_snapshot() {
+    local id="$1" key
+    unset 'SNAPSHOT_STATUS[$id]' 'SNAPSHOT_MARKERS[$id]'
+    for key in "${!SNAPSHOT_RC[@]}"; do
+        [[ "$key" == "$id|"* ]] || continue
+        unset 'SNAPSHOT_RC[$key]' 'SNAPSHOT_OUTPUT[$key]'
+    done
+}
+
+# Print one section; the status is the in-container command status, or 127
+# when the snapshot (or that section) is unavailable.
+snapshot_section() {
+    local key="$1|$2"
+    [[ -n "${SNAPSHOT_RC[$key]+x}" ]] || return 127
+    printf '%s' "${SNAPSHOT_OUTPUT[$key]}"
+    return "${SNAPSHOT_RC[$key]}"
+}
+
+freepbx_section() {
+    collect_freepbx_snapshot "$1"
+    snapshot_section "freepbx:$1" "$2"
+}
+
+mariadb_section() {
+    collect_mariadb_snapshot "$1"
+    snapshot_section "mariadb:$1" "$2"
+}
+
 check_nethvoice_asterisk_runtime() {
     local mod="$1" output version uptime reload_age channels calls
-    if output=$(timeout 10s runagent -m "$mod" podman exec freepbx asterisk -rx 'core show version' </dev/null 2>/dev/null) &&
+    if output=$(freepbx_section "$mod" version) &&
         version=$(printf '%s\n' "$output" | grep -oE '^Asterisk [0-9][0-9A-Za-z._+-]*' | head -1) && [[ -n "$version" ]]; then
         info "${mod}: ${version}"
     else
         warning "${mod}: cannot query Asterisk version (FreePBX/Asterisk may not be running)"
         return 0
     fi
-    if output=$(timeout 10s runagent -m "$mod" podman exec freepbx asterisk -rx 'core show uptime seconds' </dev/null 2>/dev/null); then
+    if output=$(freepbx_section "$mod" uptime); then
         uptime=$(printf '%s\n' "$output" | sed -nE 's/^System uptime: *([0-9]+) *$/\1/p')
         reload_age=$(printf '%s\n' "$output" | sed -nE 's/^Last reload: *([0-9]+) *$/\1/p')
         [[ "$reload_age" =~ ^[0-9]+$ ]] || reload_age=""
@@ -380,7 +729,7 @@ check_nethvoice_asterisk_runtime() {
     else
         warning "${mod}: cannot query Asterisk uptime"
     fi
-    if output=$(timeout 10s runagent -m "$mod" podman exec freepbx asterisk -rx 'core show channels count' </dev/null 2>/dev/null); then
+    if output=$(freepbx_section "$mod" channels); then
         channels=$(printf '%s\n' "$output" | sed -nE 's/^([0-9]+) active channels? *$/\1/p')
         calls=$(printf '%s\n' "$output" | sed -nE 's/^([0-9]+) active calls? *$/\1/p')
         if [[ "$channels" =~ ^[0-9]+$ && "$calls" =~ ^[0-9]+$ ]]; then
@@ -396,19 +745,57 @@ check_nethvoice_asterisk_runtime() {
 
 check_nethvoice_pjsip_contacts() {
     local mod="$1" contact_count
-    # Filter inside the container so contact URIs and device identities stay there.
-    # The variable expansion belongs to the container shell.
-    # shellcheck disable=SC2016
-    if contact_count=$(timeout 10s runagent -m "$mod" podman exec freepbx sh -c '
-        output=$(asterisk -rx "pjsip show contacts") || exit 1
-        printf "%s\n" "$output" | sed -nE "s/^Objects found: *([0-9]+) *$/\\1/p"
-    ' </dev/null 2>/dev/null) && [[ "$contact_count" =~ ^[0-9]+$ ]]; then
+    if contact_count=$(freepbx_section "$mod" contacts) && contact_count="${contact_count%$'\n'}" &&
+        [[ "$contact_count" =~ ^[0-9]+$ ]]; then
         info "${mod}: PJSIP contact objects: ${contact_count}"
         if [[ "$contact_count" == 0 ]]; then
             warning "${mod}: Asterisk running but zero PJSIP contacts"
         fi
     else
         warning "${mod}: cannot retrieve PJSIP contact count"
+    fi
+    return 0
+}
+
+check_nethvoice_pjsip_endpoints() {
+    local mod="$1" output total unavailable extra
+    if output=$(freepbx_section "$mod" endpoints) && read -r total unavailable extra <<< "$output" &&
+        [[ "$total" =~ ^[0-9]+$ && "$unavailable" =~ ^[0-9]+$ && -z "$extra" ]]; then
+        info "${mod}: PJSIP endpoints: ${total} configured, ${unavailable} unavailable"
+    else
+        warning "${mod}: cannot retrieve PJSIP endpoint counts"
+    fi
+    return 0
+}
+
+check_nethvoice_trunk_registrations() {
+    local mod="$1" output total failed extra
+    if output=$(freepbx_section "$mod" registrations) && read -r total failed extra <<< "$output" &&
+        [[ "$total" =~ ^[0-9]+$ && "$failed" =~ ^[0-9]+$ && -z "$extra" ]]; then
+        if (( failed > 0 )); then
+            problem "${mod}: ${failed} of ${total} outbound SIP registration(s) are not registered (Rejected/Unregistered/Stopped)"
+        elif (( total > 0 )); then
+            ok "${mod}: all ${total} outbound SIP registration(s) are registered"
+        else
+            info "${mod}: no outbound SIP registrations configured"
+        fi
+    else
+        warning "${mod}: cannot retrieve outbound SIP registration status"
+    fi
+    return 0
+}
+
+check_nethvoice_long_channels() {
+    local mod="$1" output total long extra
+    if output=$(freepbx_section "$mod" long_channels) && read -r total long extra <<< "$output" &&
+        [[ "$total" =~ ^[0-9]+$ && "$long" =~ ^[0-9]+$ && -z "$extra" ]]; then
+        if (( long > 0 )); then
+            warning "${mod}: ${long} of ${total} active channel(s) older than $(format_duration "$NV_CHANNEL_MAX_AGE") (possibly stuck calls)"
+        else
+            ok "${mod}: no channels older than $(format_duration "$NV_CHANNEL_MAX_AGE")"
+        fi
+    else
+        warning "${mod}: cannot retrieve active channel durations"
     fi
     return 0
 }
@@ -518,35 +905,21 @@ get_whitelist_port_expected_regex() {
 }
 
 should_skip_whitelist_port_check() {
-    local mod="$1" var_name="$2"
-    local service_state=""
+    local mod="$1" var_name="$2" unit=""
 
     PORT_CHECK_SKIP_REASON=""
 
     case "$var_name" in
-        SATELLITE_HTTP_PORT|SATELLITE_RTP_PORT)
-            service_state=$(runagent -m "$mod" systemctl --user is-active satellite.service 2>/dev/null | head -1 || true)
-            if [[ "$service_state" != "active" ]]; then
-                PORT_CHECK_SKIP_REASON="satellite.service is not running"
-                return 0
-            fi
-            ;;
-        SATELLITE_MQTT_PORT)
-            service_state=$(runagent -m "$mod" systemctl --user is-active satellite-mqtt.service 2>/dev/null | head -1 || true)
-            if [[ "$service_state" != "active" ]]; then
-                PORT_CHECK_SKIP_REASON="satellite-mqtt.service is not running"
-                return 0
-            fi
-            ;;
-        SATELLITE_PGSQL_PORT)
-            service_state=$(runagent -m "$mod" systemctl --user is-active satellite-pgsql.service 2>/dev/null | head -1 || true)
-            if [[ "$service_state" != "active" ]]; then
-                PORT_CHECK_SKIP_REASON="satellite-pgsql.service is not running"
-                return 0
-            fi
-            ;;
+        SATELLITE_HTTP_PORT|SATELLITE_RTP_PORT) unit=satellite.service ;;
+        SATELLITE_MQTT_PORT) unit=satellite-mqtt.service ;;
+        SATELLITE_PGSQL_PORT) unit=satellite-pgsql.service ;;
+        *) return 1 ;;
     esac
-
+    # Unit states were cached by check_module_services; no extra runagent call.
+    if [[ "${MODULE_UNIT_ACTIVE["$mod|$unit"]:-}" != active ]]; then
+        PORT_CHECK_SKIP_REASON="${unit} is not running"
+        return 0
+    fi
     return 1
 }
 
@@ -609,7 +982,8 @@ init_network_identity() {
     fi
 
     PUBLIC_IP=""
-    if ! command -v curl >/dev/null 2>&1; then
+    PUBLIC_IP_SOURCE=""
+    if (( OFFLINE )) || ! command -v curl >/dev/null 2>&1; then
         return
     fi
 
@@ -621,6 +995,7 @@ init_network_identity() {
         ip=$(curl -4 -fsS --max-time 5 "$ip_service" 2>/dev/null | tr -d '[:space:]' || true)
         if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
             PUBLIC_IP="$ip"
+            PUBLIC_IP_SOURCE=lookup
             return
         fi
     done
@@ -870,6 +1245,11 @@ probe_tls_certificate() {
 check_tls_certificate_endpoint() {
     local label="$1" hostname="$2" port="$3"
 
+    if (( OFFLINE )); then
+        info "${label}: certificate check skipped for ${hostname}:${port} (--offline)"
+        return 0
+    fi
+
     if probe_tls_certificate "$hostname" "$port"; then
         ok "${label}: certificate is valid for ${hostname}:${port}"
         return 0
@@ -890,75 +1270,118 @@ check_tls_certificate_endpoint() {
     return 1
 }
 
+# First UDP port in [min+1, max] without a local listener; the probe binds it.
+pick_free_udp_port() {
+    local min="$1" max="$2" port limit
+    local -A used=()
+    while read -r port; do
+        [[ "$port" =~ ^[0-9]+$ ]] && used["$port"]=1
+    done < <(ss -H -lun 2>/dev/null | awk '{n=split($4, a, ":"); print a[n]}')
+    limit=$(( max < min + 200 ? max : min + 200 ))
+    for (( port = min + 1; port <= limit; port++ )); do
+        [[ -z "${used[$port]+x}" ]] && { printf '%s\n' "$port"; return 0; }
+    done
+    return 1
+}
+
+# RTP range of the first local nethvoice-proxy, as "min max".
+get_proxy_rtp_range() {
+    local proxy_mod env_file min max
+    while read -r proxy_mod; do
+        [[ -z "$proxy_mod" ]] && continue
+        resolve_module_paths "$proxy_mod" || continue
+        env_file="${MODULE_ENV_FILES[$proxy_mod]}"
+        min=$(get_env_numeric_var "$env_file" RTP_PORT_MIN)
+        max=$(get_env_numeric_var "$env_file" RTP_PORT_MAX)
+        if [[ -n "$min" && -n "$max" ]] && (( min < max && max <= 65535 )); then
+            printf '%s %s\n' "$min" "$max"
+            return 0
+        fi
+    done <<< "$(get_modules_by_name nethvoice-proxy)"
+    return 1
+}
+
 check_hairpin_nat_for_nethvoice() {
     local nv_mod="$1"
-    local port processes
+    local sip_port=5060 tls_port=5061 rtp_port="" rtp_min rtp_max configured processes port
     local expected_regex='(^| )kamailio( |$)'
 
+    if (( OFFLINE )); then
+        info "${nv_mod}: hairpin NAT checks skipped (--offline)"
+        return
+    fi
     if [[ -z "$PUBLIC_IP" ]]; then
         info "${nv_mod}: hairpin NAT checks skipped: public IP not available"
         return
     fi
-
     if is_local_ip "$PUBLIC_IP"; then
         info "${nv_mod}: hairpin NAT checks skipped: public IP matches a local machine address (${PUBLIC_IP})"
         return
     fi
 
-    for port in 5060 5061 10001; do
-        if [[ "$port" != "10001" ]] && ! is_port_listening "$port"; then
+    # Kamailio signaling uses the instance PROXY_PORT; SIP/TLS is fixed at 5061.
+    if resolve_module_paths "$nv_mod"; then
+        configured=$(get_env_numeric_var "${MODULE_ENV_FILES[$nv_mod]}" PROXY_PORT)
+        [[ -n "$configured" ]] && sip_port="$configured"
+    fi
+    if read -r rtp_min rtp_max < <(get_proxy_rtp_range); then
+        rtp_port=$(pick_free_udp_port "$rtp_min" "$rtp_max") || rtp_port=""
+    else
+        rtp_port=10001
+    fi
+
+    for port in "$sip_port" "$tls_port"; do
+        if ! is_port_listening "$port"; then
             info "${nv_mod}: hairpin NAT check skipped for port ${port}: port is not listening"
             continue
         fi
-
-        if [[ "$port" != "10001" ]] && ! is_port_listening_by_process "$port" "$expected_regex"; then
+        if ! is_port_listening_by_process "$port" "$expected_regex"; then
             processes=$(get_listener_processes_by_port "$port")
             info "${nv_mod}: hairpin NAT check skipped for port ${port}: port is owned by [${processes:-unknown}] instead of kamailio"
             continue
         fi
-
-        case "$port" in
-            5060)
-                if probe_hairpin_sip "$PUBLIC_IP" "$port" "udp"; then
-                    ok "${nv_mod}: hairpin NAT works for SIP/UDP port ${port} via ${PUBLIC_IP}"
-                else
-                    case $? in
-                        2) info "${nv_mod}: hairpin NAT check skipped for SIP/UDP port ${port}: /dev/udp is not available" ;;
-                        *) problem "${nv_mod}: hairpin NAT failed for SIP/UDP port ${port} via ${PUBLIC_IP}" ;;
-                    esac
-                fi
-                if probe_hairpin_sip "$PUBLIC_IP" "$port" "tcp"; then
-                    ok "${nv_mod}: hairpin NAT works for SIP/TCP port ${port} via ${PUBLIC_IP}"
-                else
-                    case $? in
-                        2) info "${nv_mod}: hairpin NAT check skipped for SIP/TCP port ${port}: /dev/tcp is not available" ;;
-                        *) problem "${nv_mod}: hairpin NAT failed for SIP/TCP port ${port} via ${PUBLIC_IP}" ;;
-                    esac
-                fi
-                ;;
-            5061)
-                if probe_hairpin_tcp_tls "$PUBLIC_IP" "$port"; then
-                    ok "${nv_mod}: hairpin NAT works for SIP/TLS port ${port} via ${PUBLIC_IP}"
-                else
-                    case $? in
-                        2) info "${nv_mod}: hairpin NAT check skipped for SIP/TLS port ${port}: openssl is not available" ;;
-                        *) problem "${nv_mod}: hairpin NAT failed for SIP/TLS port ${port} via ${PUBLIC_IP}" ;;
-                    esac
-                fi
-                ;;
-            10001)
-                if probe_hairpin_udp_by_local_listener "$PUBLIC_IP" "$port"; then
-                    ok "${nv_mod}: hairpin NAT works for UDP port ${port} via ${PUBLIC_IP}"
-                else
-                    case $? in
-                        2) info "${nv_mod}: hairpin NAT check skipped for UDP port ${port}: Python 3 is not available" ;;
-                        3) problem "${nv_mod}: hairpin NAT check for UDP port ${port} could not start a local listener on port ${port}" ;;
-                        *) problem "${nv_mod}: hairpin NAT failed for UDP port ${port} via ${PUBLIC_IP}" ;;
-                    esac
-                fi
-                ;;
-        esac
+        if [[ "$port" == "$sip_port" ]]; then
+            if probe_hairpin_sip "$PUBLIC_IP" "$port" "udp"; then
+                ok "${nv_mod}: hairpin NAT works for SIP/UDP port ${port} via ${PUBLIC_IP}"
+            else
+                case $? in
+                    2) info "${nv_mod}: hairpin NAT check skipped for SIP/UDP port ${port}: /dev/udp is not available" ;;
+                    *) problem "${nv_mod}: hairpin NAT failed for SIP/UDP port ${port} via ${PUBLIC_IP}" ;;
+                esac
+            fi
+            if probe_hairpin_sip "$PUBLIC_IP" "$port" "tcp"; then
+                ok "${nv_mod}: hairpin NAT works for SIP/TCP port ${port} via ${PUBLIC_IP}"
+            else
+                case $? in
+                    2) info "${nv_mod}: hairpin NAT check skipped for SIP/TCP port ${port}: /dev/tcp is not available" ;;
+                    *) problem "${nv_mod}: hairpin NAT failed for SIP/TCP port ${port} via ${PUBLIC_IP}" ;;
+                esac
+            fi
+        else
+            if probe_hairpin_tcp_tls "$PUBLIC_IP" "$port"; then
+                ok "${nv_mod}: hairpin NAT works for SIP/TLS port ${port} via ${PUBLIC_IP}"
+            else
+                case $? in
+                    2) info "${nv_mod}: hairpin NAT check skipped for SIP/TLS port ${port}: openssl is not available" ;;
+                    *) problem "${nv_mod}: hairpin NAT failed for SIP/TLS port ${port} via ${PUBLIC_IP}" ;;
+                esac
+            fi
+        fi
     done
+
+    if [[ -z "$rtp_port" ]]; then
+        info "${nv_mod}: hairpin NAT check skipped for RTP: no free UDP port in the proxy RTP range"
+        return
+    fi
+    if probe_hairpin_udp_by_local_listener "$PUBLIC_IP" "$rtp_port"; then
+        ok "${nv_mod}: hairpin NAT works for RTP UDP port ${rtp_port} via ${PUBLIC_IP}"
+    else
+        case $? in
+            2) info "${nv_mod}: hairpin NAT check skipped for UDP port ${rtp_port}: Python 3 is not available" ;;
+            3) problem "${nv_mod}: hairpin NAT check for UDP port ${rtp_port} could not start a local listener on port ${rtp_port}" ;;
+            *) problem "${nv_mod}: hairpin NAT failed for RTP UDP port ${rtp_port} via ${PUBLIC_IP}" ;;
+        esac
+    fi
 }
 
 get_env_numeric_var() {
@@ -1100,21 +1523,29 @@ check_nethvoice_proxy_domain_uri() {
     fi
 }
 
+check_nethvoice_mysqlcheck() {
+    local nv_mod="$1" mysql_out
+    mysql_out=$(mariadb_section "$nv_mod" mysqlcheck)
+    if [[ $? == 127 ]]; then
+        warning "${nv_mod}: mysqlcheck could not run (mariadb container may not be running)"
+    elif echo "$mysql_out" | grep -qiE 'error|corrupt|crashed'; then
+        problem "${nv_mod}: mysqlcheck reported errors:"
+        echo "$mysql_out" | grep -iE 'error|corrupt|crashed' | while read -r line; do
+            echo "  ${line}"
+        done
+    elif [[ -z "$mysql_out" ]]; then
+        warning "${nv_mod}: mysqlcheck returned no output (mariadb container may not exist)"
+    else
+        ok "${nv_mod}: mysqlcheck OK"
+    fi
+}
+
 check_nethvoice_localnets() {
     local nv_mod="$1"
-    local localnets_out localnets_rc
+    local localnets_out row_key row_val row_type row_id
 
-    # Database credentials expand inside the container, not on the host.
-    # shellcheck disable=SC2016
-    localnets_out=$(runagent -m "$nv_mod" podman exec mariadb \
-        sh -c 'mysql -uroot -p${MARIADB_ROOT_PASSWORD} -N -B asterisk -e "SELECT \`key\`, val, type, id FROM kvstore_Sipsettings WHERE \`key\` = '\''localnets'\'';"' 2>&1)
-    localnets_rc=$?
-
-    if [[ "$localnets_rc" -ne 0 ]]; then
+    if ! localnets_out=$(mariadb_section "$nv_mod" localnets); then
         warning "${nv_mod}: could not query asterisk.kvstore_Sipsettings for localnets"
-        while read -r line; do
-            [[ -n "$line" ]] && echo "  ${line}"
-        done <<< "$localnets_out"
         return
     fi
 
@@ -1129,23 +1560,28 @@ check_nethvoice_localnets() {
     fi
 }
 
+check_nethvoice_need_reload() {
+    local nv_mod="$1" need_reload
+    if ! need_reload=$(mariadb_section "$nv_mod" need_reload); then
+        warning "${nv_mod}: could not query FreePBX pending-reload state"
+        return
+    fi
+    need_reload="${need_reload%$'\n'}"
+    if [[ "$need_reload" == true ]]; then
+        warning "${nv_mod}: FreePBX has configuration changes that are not applied (Apply Config pending)"
+    else
+        ok "${nv_mod}: no pending FreePBX configuration changes"
+    fi
+}
+
 check_nethvoice_astdb_cidname() {
     local nv_mod="$1"
-    local cidname_out wrong_cidname_entries
+    local wrong_cidname_entries line
 
-    cidname_out=$(runagent -m "$nv_mod" podman exec freepbx asterisk -rx 'database show AMPUSER' 2>/dev/null || true)
-
-    if [[ -z "$cidname_out" ]]; then
+    if ! wrong_cidname_entries=$(freepbx_section "$nv_mod" cidname); then
         info "${nv_mod}: could not retrieve AstDB AMPUSER entries"
         return
     fi
-
-    wrong_cidname_entries=$(echo "$cidname_out" | awk '
-        /^[[:space:]]*\/AMPUSER\/\/cidname[[:space:]]*:/ {
-            sub(/^[[:space:]]+/, "", $0)
-            print
-        }
-    ')
 
     if [[ -n "$wrong_cidname_entries" ]]; then
         warning "${nv_mod}: Wrong cidname in astdb, run \`database del AMPUSER/ cidname\` in asterisk CLI"
@@ -1158,18 +1594,12 @@ check_nethvoice_astdb_cidname() {
 }
 
 check_nethvoice_email_from_address() {
-    local nv_mod="$1"
-    local smtp_from voicemail_mailcmd
+    local nv_mod="$1" smtp_from voicemail_mailcmd
 
-    smtp_from=$(runagent -m "$nv_mod" podman exec freepbx sh -c 'printenv SMTP_FROM_ADDRESS' 2>/dev/null || true)
-    smtp_from=$(echo "$smtp_from" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    smtp_from=$(freepbx_section "$nv_mod" smtp_from)
+    voicemail_mailcmd=$(freepbx_section "$nv_mod" mailcmd_from)
 
-    voicemail_mailcmd=$(runagent -m "$nv_mod" podman exec freepbx \
-        sh -c "grep -E '^[[:space:]]*mailcmd[[:space:]]*=' /etc/asterisk/voicemail.conf 2>/dev/null | grep -F -- 'send_email -f '" \
-        2>/dev/null || true)
-    voicemail_mailcmd=$(echo "$voicemail_mailcmd" | head -n1 | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-
-    if [[ -n "$smtp_from" || -n "$voicemail_mailcmd" ]]; then
+    if [[ "${smtp_from%$'\n'}" == 1 || "${voicemail_mailcmd%$'\n'}" == 1 ]]; then
         ok "${nv_mod}: email from address configured"
     else
         warning "${nv_mod}: no email from address configured in freepbx (SMTP_FROM_ADDRESS or voicemail.conf mailcmd -f)"
@@ -1177,25 +1607,30 @@ check_nethvoice_email_from_address() {
 }
 
 # Inspect a bounded tail in one pass; print pattern names, never log records.
+# Print each pattern (one per line in $1) that matches stdin, case-insensitively.
+match_log_patterns() {
+    SYSANAL_LOG_PATTERNS="$1" awk '
+        BEGIN {
+            count=split(ENVIRON["SYSANAL_LOG_PATTERNS"], patterns, "\n")
+            for (i=1; i<=count; i++) folded[i]=tolower(patterns[i])
+        }
+        {
+            line=tolower($0)
+            for (i=1; i<=count; i++)
+                if (patterns[i] != "" && !matched[i] && line ~ folded[i]) matched[i]=1
+        }
+        END {
+            for (i=1; i<=count; i++) if (matched[i]) print patterns[i]
+        }'
+}
+
 scan_recent_log_patterns() {
     local log_file="$1" patterns="$2" status
     local -a scan_status=()
     [[ "$LOG_SCAN_MAX_BYTES" =~ ^[1-9][0-9]*$ && "$LOG_SCAN_MAX_LINES" =~ ^[1-9][0-9]*$ ]] || return 2
     tail -c "$LOG_SCAN_MAX_BYTES" -- "$log_file" 2>/dev/null |
         tail -n "$LOG_SCAN_MAX_LINES" |
-        SYSANAL_LOG_PATTERNS="$patterns" awk '
-            BEGIN {
-                count=split(ENVIRON["SYSANAL_LOG_PATTERNS"], patterns, "\n")
-                for (i=1; i<=count; i++) folded[i]=tolower(patterns[i])
-            }
-            {
-                line=tolower($0)
-                for (i=1; i<=count; i++)
-                    if (patterns[i] != "" && !matched[i] && line ~ folded[i]) matched[i]=1
-            }
-            END {
-                for (i=1; i<=count; i++) if (matched[i]) print patterns[i]
-            }'
+        match_log_patterns "$patterns"
     scan_status=("${PIPESTATUS[@]}")
     for status in "${scan_status[@]}"; do
         [[ "$status" == 0 ]] || return 2
@@ -1209,7 +1644,7 @@ check_nethvoice_asterisk_full_logs() {
     # FreePBX has Bash; unavailable runtimes are reported as skipped checks.
     # shellcheck disable=SC2016
     if ! log_scan_out=$({
-        declare -f scan_recent_log_patterns
+        declare -f match_log_patterns scan_recent_log_patterns
         printf '%s\n' 'LOG_SCAN_MAX_BYTES="$3"; LOG_SCAN_MAX_LINES="$4"; scan_recent_log_patterns "$1" "$2"'
     } | timeout 15s runagent -m "$nv_mod" podman exec -i freepbx bash -s -- \
         /var/log/asterisk/full "$ASTERISK_FULL_LOG_ERROR_PATTERNS" \
@@ -1236,7 +1671,7 @@ check_system_messages_log() {
     if ! log_scan_out=$(timeout 15s bash -c \
         'LOG_SCAN_MAX_BYTES="$3"; LOG_SCAN_MAX_LINES="$4"; source /dev/stdin; scan_recent_log_patterns "$1" "$2"' \
         bash "$log_file" "$MESSAGES_LOG_ERROR_PATTERNS" "$LOG_SCAN_MAX_BYTES" "$LOG_SCAN_MAX_LINES" \
-        < <(declare -f scan_recent_log_patterns) 2>/dev/null); then
+        < <(declare -f match_log_patterns scan_recent_log_patterns) 2>/dev/null); then
         warning "Could not scan the recent ${log_file} for common errors"
         return 0
     fi
@@ -1324,7 +1759,7 @@ check_nethvoice_asterisk_port_alignment() {
 
     expected_sip_port=$(get_env_numeric_var "$nv_env_file" "ASTERISK_SIP_PORT")
     if [[ -n "$expected_sip_port" ]]; then
-        pjsip_transports=$(runagent -m "$nv_mod" podman exec freepbx asterisk -rx 'pjsip show transports' 2>/dev/null || true)
+        pjsip_transports=$(freepbx_section "$nv_mod" transports)
         if [[ -n "$pjsip_transports" ]]; then
             if echo "$pjsip_transports" | grep -qE ":[[:space:]]*${expected_sip_port}([[:space:]]|$)|:${expected_sip_port}/"; then
                 ok "${nv_mod}: Asterisk PJSIP transport uses ASTERISK_SIP_PORT=${expected_sip_port}"
@@ -1426,245 +1861,1106 @@ EOF
 
 LOG_SCAN_MAX_BYTES=1048576     # Inspect at most the last 1 MiB of each active log
 LOG_SCAN_MAX_LINES=20000       # Inspect at most this many lines within that tail
+LOG_SIZE_WARNING_BYTES=1073741824  # Warn when the active /var/log/messages exceeds 1 GiB
+JOURNAL_SCAN_HOURS=24          # Error-priority journal window
+JOURNAL_NOISY_SOURCE_COUNT=1000    # Warn when one source logs this many error entries in the window
 RESTART_THRESHOLD=5            # Container/service restarts above this count flag a problem
+RESTART_RECENT_SECONDS=86400   # Restart bursts older than this (unit stable since) are informational
+RUNAGENT_TIMEOUT=15            # Seconds allowed for each module-context runagent query
+FS_WARNING_PCT=85              # Filesystem block/inode usage warning threshold
+FS_PROBLEM_PCT=95              # Filesystem block/inode usage problem threshold
 MEMORY_WARNING_PCT=90          # Memory usage based on MemAvailable
 MEMORY_PROBLEM_PCT=95          # Severe memory usage threshold
 DNS_SLOW_MS=2000               # DNS resolution slower than this (ms) flags a problem
 QUEUE_RINGALL_MAX_QUEUES=3     # Warn if ringall strategy is used by more than this number of queues
 QUEUE_RINGALL_MAX_AGENTS=5     # Warn if any ringall queue has more than this number of agents
+NV_CHANNEL_MAX_AGE=14400       # Asterisk channels older than this (seconds) may be stuck calls
+WG_HANDSHAKE_MAX_AGE=300       # WireGuard peers without a handshake for this long are unreachable
+BACKUP_AGE_GRACE_SECONDS=3600  # Slack added to twice the backup interval before a run is overdue
+PODMAN_RECLAIMABLE_WARNING_BYTES=10000000000  # Warn when unused rootful images exceed 10 GB
+SUBSCRIPTION_EXPIRY_WARNING_DAYS=30  # Warn when the subscription expires within this many days
 INTERNET_OK=1                  # Set to 0 if connectivity precheck fails
 SILENT=0                       # Set to 1 to suppress OK and INFO messages
-
-# Sourcing defines helpers for local tests without executing the analyzer.
-if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
-    return 0
-fi
+OFFLINE=0                      # Set to 1 (--offline) to skip external lookups and active probes
+JSON_OUTPUT=0                  # Set to 1 (--json) for a JSON report on stdout
 
 # ---------------------------------------------------------------------------
-# Argument parsing
+# Cluster inventory helpers
 # ---------------------------------------------------------------------------
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -s|--silent) SILENT=1; shift ;;
-        --worker) shift ;;
-        *)        shift ;;
+MODULES_ON_NODE=""
+MODULES=""
+NODE_ID=""
+IS_LEADER=0
+CLUSTER_ROLE="unknown"
+PUBLIC_IP_SOURCE=""
+SUBSCRIPTION_SYSTEM_ID=""
+declare -A CLUSTER_MODULE_NODE=()  # every module ID in the cluster -> node ID
+declare -A NODE_VPN_IP=()          # node ID -> VPN address
+declare -A VPN_IP_NODE=()          # VPN address -> node ID
+
+# Module IDs on this node whose image name (field 4 of MODULES_ON_NODE) is $1.
+get_modules_by_name() {
+    [[ -n "$MODULES_ON_NODE" ]] || return 0
+    awk -F'|' -v name="$1" '$4 == name {print $1}' <<< "$MODULES_ON_NODE"
+}
+
+# Join "count name" lines as "name (count), ...".
+format_top_counts() {
+    awk '{ printf "%s%s (%s)", sep, $2, $1; sep = ", " }'
+}
+
+human_bytes() {
+    awk -v b="$1" 'BEGIN {
+        split("B KiB MiB GiB TiB", u, " "); i = 1
+        while (b >= 1024 && i < 5) { b /= 1024; i++ }
+        if (i == 1) printf "%d %s\n", b, u[i]; else printf "%.1f %s\n", b, u[i]
+    }'
+}
+
+# Convert Podman sizes such as "15.71GB" or "161.8MB (3%)" to bytes.
+size_to_bytes() {
+    awk -v s="$1" 'BEGIN {
+        if (!match(s, /^[0-9.]+/)) exit 1
+        n = substr(s, 1, RLENGTH); u = toupper(substr(s, RLENGTH + 1)); m = 1
+        if (u ~ /^K/) m = 1e3; else if (u ~ /^M/) m = 1e6; else if (u ~ /^G/) m = 1e9; else if (u ~ /^T/) m = 1e12
+        printf "%.0f\n", n * m
+    }'
+}
+
+journal_errors_command() {
+    timeout 30s journalctl -p 0..3 --since "-${JOURNAL_SCAN_HOURS}h" -n "$LOG_SCAN_MAX_LINES" \
+        -q --no-pager -o short-unix </dev/null 2>/dev/null
+}
+
+# Slow, independent commands run while other checks proceed.
+start_background_jobs() {
+    BG_DIR=$(mktemp -d 2>/dev/null) || { BG_DIR=""; return 0; }
+    # shellcheck disable=SC2064
+    trap "rm -rf -- '$BG_DIR'" EXIT
+    if command -v podman >/dev/null 2>&1; then
+        start_query podman-df timeout 120s podman system df --format '{{.Type}}|{{.Size}}|{{.Reclaimable}}'
+    fi
+    if command -v needs-restarting >/dev/null 2>&1; then
+        start_query reboot timeout 120s needs-restarting -r
+    fi
+    if command -v journalctl >/dev/null 2>&1; then
+        start_query journal journal_errors_command
+    fi
+}
+
+# Run module-context queries in parallel: first contexts, then runtime data
+# that depends on the execution UID, plus NethVoice and proxy snapshots.
+prefetch_module_contexts() {
+    local mod
+    [[ -n "$BG_DIR" ]] || return 0
+    while IFS= read -r mod; do
+        [[ -z "$mod" ]] && continue
+        start_query "context.$mod" module_context_command "$mod"
+    done <<< "$MODULES"
+}
+
+prefetch_module_runtime() {
+    local mod
+    [[ -n "$BG_DIR" ]] || return 0
+    while IFS= read -r mod; do
+        [[ -z "$mod" ]] && continue
+        resolve_module_runtime "$mod" || continue
+        start_query "containers.$mod" module_containers_command "$mod"
+        start_query "services.$mod" module_services_command "$mod"
+    done <<< "$MODULES"
+    while IFS= read -r mod; do
+        [[ -z "$mod" ]] && continue
+        prefetch_snapshot freepbx "$mod"
+        prefetch_snapshot mariadb "$mod"
+    done <<< "$(get_modules_by_name nethvoice)"
+    while IFS= read -r mod; do
+        [[ -z "$mod" ]] && continue
+        prefetch_snapshot proxy "$mod"
+    done <<< "$(get_modules_by_name nethvoice-proxy)"
+}
+
+# Read local node identity, cluster role and the module inventory from Redis.
+discover_node_and_modules() {
+    local module_node_raw prev_key="" line mod_id mod_node image_url source version module role
+    # NODE_ID is stored in /var/lib/nethserver/node/state/environment
+    NODE_ID=$(grep -oP '^NODE_ID=\K.*' /var/lib/nethserver/node/state/environment 2>/dev/null || true)
+    if [[ -z "$NODE_ID" ]]; then
+        # Fallback: extract from AGENT_ID in agent.env (e.g. "node/1" -> "1")
+        NODE_ID=$(grep -oP '^AGENT_ID=node/\K\d+' /var/lib/nethserver/node/state/agent.env 2>/dev/null || true)
+    fi
+    if [[ -z "$NODE_ID" ]]; then
+        problem "Cannot determine node ID (checked /var/lib/nethserver/node/state/environment and agent.env)"
+        NODE_ID="1"
+    fi
+
+    # The leader runs the Redis master; workers run read-only replicas.
+    role=$(redis-cli --raw ROLE </dev/null 2>/dev/null | head -1)
+    case "$role" in
+        master) IS_LEADER=1; CLUSTER_ROLE=leader ;;
+        slave|replica) IS_LEADER=0; CLUSTER_ROLE=worker ;;
+        *)
+            if [[ "$NODE_ID" == 1 ]]; then IS_LEADER=1; CLUSTER_ROLE=leader; else IS_LEADER=0; CLUSTER_ROLE=worker; fi
+            warning "Cannot determine the cluster role from Redis ROLE; assuming ${CLUSTER_ROLE} from node ID ${NODE_ID}"
+            ;;
     esac
-done
+    load_cluster_nodes
+    info "Node ${NODE_ID} is the cluster ${CLUSTER_ROLE}; ${#NODE_VPN_IP[@]} node(s) registered in the cluster"
 
-# ---------------------------------------------------------------------------
-# Pre-flight
-# ---------------------------------------------------------------------------
-if [[ $EUID -ne 0 ]]; then
-    echo "This script must be run as root"
-    exit 1
-fi
-
-echo -e "${BOLD}sysanal3 - NethServer 8 System Analyzer V3${NC}"
-echo "========================================="
-echo "Date: $(date)"
-
-init_network_identity
-
-# ---------------------------------------------------------------------------
-# Internet connectivity precheck
-# ---------------------------------------------------------------------------
-header "Pre-check: Internet connectivity"
-
-if ping -qc 1 -W 3 sos.nethesis.it &>/dev/null; then
-    ok "Internet connectivity OK (sos.nethesis.it reachable)"
-else
-    warning "No internet connectivity (sos.nethesis.it unreachable) — GitHub version checks will be skipped"
-    INTERNET_OK=0
-fi
-
-# ---------------------------------------------------------------------------
-# General System Data
-# ---------------------------------------------------------------------------
-header "General System Data"
-
-# IP addresses
-info_always "IP addresses: ${LOCAL_IPS_DISPLAY}"
-info_always "Public IP: ${PUBLIC_IP:-unavailable}"
-if [[ -z "$PUBLIC_IP" ]]; then
-    warning "Public IP could not be determined; hairpin NAT checks will be skipped"
-fi
-
-# DNS nameservers
-_nameservers=$(grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | xargs || true)
-info_always "DNS nameservers: ${_nameservers:-N/A}"
-
-# Hostname / FQDN
-info_always "Hostname: $(hostname -f 2>/dev/null || hostname 2>/dev/null || echo 'N/A')"
-
-# Open file descriptors
-_filenr=$(cat /proc/sys/fs/file-nr 2>/dev/null || true)
-if [[ -n "$_filenr" ]]; then
-    _used=$(echo "$_filenr" | awk '{print $1}')
-    _max=$(echo "$_filenr" | awk '{print $3}')
-    info_always "Open file descriptors: ${_used} / ${_max}"
-    if [[ "$_max" -gt 0 ]] && (( _used * 100 / _max >= 90 )); then
-        problem "Open file descriptors at ${_used}/${_max} (>= 90%)"
+    # Redis on workers runs as a replica: all cluster/* and module/* keys are
+    # replicated from the leader, so read operations work everywhere.
+    # Output format per line: id|source|version|module
+    MODULES_ON_NODE=""
+    CLUSTER_MODULE_NODE=()
+    local -a local_ids=() image_urls=()
+    local i
+    module_node_raw=$(redis-cli --raw HGETALL cluster/module_node </dev/null 2>/dev/null || true)
+    if [[ -n "$module_node_raw" ]]; then
+        # HGETALL returns alternating key/value lines: module_id\nnode_id\n...
+        while IFS= read -r line; do
+            if [[ -z "$prev_key" ]]; then
+                prev_key="$line"
+                continue
+            fi
+            mod_id="$prev_key"
+            mod_node="$line"
+            prev_key=""
+            CLUSTER_MODULE_NODE["$mod_id"]="$mod_node"
+            [[ "$mod_node" == "$NODE_ID" ]] && local_ids+=("$mod_id")
+        done <<< "$module_node_raw"
+        if (( ${#local_ids[@]} > 0 )); then
+            mapfile -t image_urls < <(printf 'HGET module/%s/environment IMAGE_URL\n' "${local_ids[@]}" | redis_batch)
+        fi
+        for i in "${!local_ids[@]}"; do
+            mod_id="${local_ids[$i]}"
+            image_url="${image_urls[$i]:-}"
+            [[ -z "$image_url" ]] && continue
+            # Parse: source = URL without tag, version = tag, module = last path component of source
+            source="${image_url%:*}"
+            version="${image_url##*:}"
+            module="${source##*/}"
+            MODULES_ON_NODE+="${mod_id}|${source}|${version}|${module}"$'\n'
+        done
+        MODULES_ON_NODE=$(echo "$MODULES_ON_NODE" | sort | sed '/^$/d')
+    else
+        warning "Cannot retrieve installed modules from Redis"
     fi
-fi
+    MODULES=$(echo "$MODULES_ON_NODE" | cut -d'|' -f1 | grep -v '^$' || true)
+}
 
-# Root filesystem usage
-_rootfs=$(df -h / 2>/dev/null | awk 'NR==2{printf "%s used / %s total (%s full)", $3, $2, $5}')
-info_always "Root filesystem: ${_rootfs:-N/A}"
-_root_pct=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}')
-if [[ -n "$_root_pct" && "$_root_pct" -ge 90 ]]; then
-    problem "Root filesystem usage at ${_root_pct}% (>= 90%)"
-fi
+load_cluster_nodes() {
+    local key i
+    local -a nodes=() ips=()
+    NODE_VPN_IP=()
+    VPN_IP_NODE=()
+    while IFS= read -r key; do
+        [[ "$key" =~ ^node/([0-9]+)/vpn$ ]] && nodes+=("${BASH_REMATCH[1]}")
+    done < <(redis-cli --raw --scan --pattern 'node/*/vpn' </dev/null 2>/dev/null)
+    (( ${#nodes[@]} > 0 )) || return 0
+    mapfile -t ips < <(printf 'HGET node/%s/vpn ip_address\n' "${nodes[@]}" | redis_batch)
+    for i in "${!nodes[@]}"; do
+        NODE_VPN_IP["${nodes[$i]}"]="${ips[$i]:-}"
+        [[ -n "${ips[$i]:-}" ]] && VPN_IP_NODE["${ips[$i]}"]="${nodes[$i]}"
+    done
+}
 
-# CPU load average
-_cpu_cores=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || true)
-_load_avg_1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || true)
-if [[ -n "$_cpu_cores" && -n "$_load_avg_1" ]]; then
-    info_always "CPU load average (1m): ${_load_avg_1} on ${_cpu_cores} core(s)"
-    if awk -v load_avg="$_load_avg_1" -v cores="$_cpu_cores" 'BEGIN { exit !(load_avg > (2 * cores)) }'; then
-        problem "CPU load average is ${_load_avg_1} on ${_cpu_cores} core(s) (> 2x core count)"
-    elif awk -v load_avg="$_load_avg_1" -v cores="$_cpu_cores" 'BEGIN { exit !(load_avg > cores) }'; then
-        warning "CPU load average is ${_load_avg_1} on ${_cpu_cores} core(s) (> core count)"
+# ---------------------------------------------------------------------------
+# Host checks
+# ---------------------------------------------------------------------------
+# Block and inode usage of the filesystem containing $2.
+check_filesystem_usage() {
+    local label="$1" path="$2" pct ipct
+    pct=$(df -P -- "$path" 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}')
+    if [[ "$pct" =~ ^[0-9]+$ ]]; then
+        if (( pct >= FS_PROBLEM_PCT )); then
+            problem "${label} usage at ${pct}% (>= ${FS_PROBLEM_PCT}%)"
+        elif (( pct >= FS_WARNING_PCT )); then
+            warning "${label} usage at ${pct}% (>= ${FS_WARNING_PCT}%)"
+        fi
     fi
-fi
+    # Some filesystems (e.g. btrfs) report "-" for inodes.
+    ipct=$(df -iP -- "$path" 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}')
+    if [[ "$ipct" =~ ^[0-9]+$ ]]; then
+        if (( ipct >= FS_PROBLEM_PCT )); then
+            problem "${label} inode usage at ${ipct}% (>= ${FS_PROBLEM_PCT}%)"
+        elif (( ipct >= FS_WARNING_PCT )); then
+            warning "${label} inode usage at ${ipct}% (>= ${FS_WARNING_PCT}%)"
+        fi
+    fi
+    return 0
+}
 
-# Memory and swap pressure (uses available memory, including reclaimable cache)
-check_node_memory
+check_readonly_mounts() {
+    local target fstype options found=0
+    while read -r target fstype options; do
+        case "$fstype" in ext2|ext3|ext4|xfs|btrfs) ;; *) continue ;; esac
+        [[ ",${options}," == *,ro,* ]] || continue
+        problem "Filesystem ${target} (${fstype}) is mounted read-only"
+        found=1
+    done < <(findmnt -rn -o TARGET,FSTYPE,OPTIONS 2>/dev/null)
+    (( found )) || ok "No local disk filesystem is mounted read-only"
+    return 0
+}
 
-# Uptime
-info_always "Uptime: $(uptime -p 2>/dev/null || uptime | sed 's/.*up/up/' || echo 'N/A')"
+check_time_sync() {
+    local synced
+    synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)
+    case "$synced" in
+        yes) ok "System clock is NTP-synchronized" ;;
+        no) warning "System clock is not NTP-synchronized (TLS, SIP, tokens and backups depend on correct time)" ;;
+        *) info "Cannot determine NTP synchronization state" ;;
+    esac
+}
 
-# Timezone
-_tz=$(timedatectl 2>/dev/null | grep -i 'time zone' | awk '{print $3, $4, $5}' || true)
-info_always "Timezone: ${_tz:-N/A}"
+check_reboot_required() {
+    local rc
+    if fetch_query reboot; then
+        rc="$QUERY_RC"
+        case "$rc" in
+            0) ok "No reboot required by installed updates" ;;
+            1) warning "Reboot required: updated core packages are installed but not running (running kernel $(uname -r))" ;;
+            *) info "Could not determine whether a reboot is required (needs-restarting exit status ${rc:-unknown})" ;;
+        esac
+    elif [[ -e /run/reboot-required ]]; then
+        warning "Reboot required (/run/reboot-required is present)"
+    elif command -v dpkg >/dev/null 2>&1; then
+        ok "No reboot required by installed updates"
+    else
+        info "Reboot requirement cannot be determined (needs-restarting is not available)"
+    fi
+}
 
-# Cluster subscription system_id
-_sub_id=$(redis-cli --raw hget cluster/subscription system_id 2>/dev/null || true)
-if [[ -z "$_sub_id" ]]; then
-    warning "Cluster subscription system_id is empty or missing"
-else
-    info_always "Subscription system_id: ${_sub_id}"
-fi
+check_selinux_denials() {
+    local mode out count top
+    command -v getenforce >/dev/null 2>&1 || return 0
+    mode=$(getenforce 2>/dev/null)
+    [[ "$mode" == Enforcing || "$mode" == Permissive ]] || return 0
+    if ! command -v ausearch >/dev/null 2>&1; then
+        info "SELinux ${mode}: ausearch is not available; denial check skipped"
+        return 0
+    fi
+    # ausearch exits 1 when nothing matches.
+    out=$(timeout 20s ausearch -m AVC,USER_AVC -ts today </dev/null 2>/dev/null)
+    count=$(grep -cE '^type=(AVC|USER_AVC) ' <<< "$out")
+    if (( count > 0 )); then
+        top=$(grep -oE 'comm="[^"]+"' <<< "$out" | sed 's/^comm="//; s/"$//' | sort | uniq -c | sort -rn | head -3 | format_top_counts)
+        warning "SELinux (${mode}): ${count} denial(s) today${top:+ (top processes: ${top})}"
+    else
+        ok "SELinux (${mode}): no denials today"
+    fi
+}
 
-# Cluster UUID
-_cluster_uuid=$(redis-cli --raw get cluster/uuid 2>/dev/null || true)
-info_always "Cluster UUID: ${_cluster_uuid:-N/A}"
+check_redis_persistence() {
+    local out rdb aof_enabled aof
+    if ! out=$(redis-cli info persistence </dev/null 2>/dev/null | tr -d '\r') || [[ -z "$out" ]]; then
+        warning "Cannot query Redis persistence status"
+        return 0
+    fi
+    rdb=$(sed -n 's/^rdb_last_bgsave_status://p' <<< "$out")
+    aof_enabled=$(sed -n 's/^aof_enabled://p' <<< "$out")
+    aof=$(sed -n 's/^aof_last_write_status://p' <<< "$out")
+    if [[ -n "$rdb" && "$rdb" != ok ]]; then
+        problem "Redis last background save failed (rdb_last_bgsave_status=${rdb}); cluster data may not persist"
+    elif [[ "$aof_enabled" == 1 && "$aof" != ok ]]; then
+        problem "Redis append-only file write failed (aof_last_write_status=${aof:-unknown})"
+    else
+        ok "Redis persistence is healthy"
+    fi
+}
 
-# ---------------------------------------------------------------------------
-# 1. Check for sngrep running > 1 day
-# ---------------------------------------------------------------------------
-header "Check: sngrep long-running instances"
+check_podman_storage() {
+    local rc type size reclaimable images_size="" images_reclaimable="" volumes_size="" bytes
+    if ! fetch_query podman-df; then
+        info "Rootful Podman storage usage is not available"
+        return 0
+    fi
+    rc="$QUERY_RC"
+    if [[ "$rc" != 0 ]]; then
+        info "Rootful Podman storage usage could not be computed (podman system df exit status ${rc:-unknown})"
+        return 0
+    fi
+    while IFS='|' read -r type size reclaimable; do
+        case "$type" in
+            Images) images_size="$size"; images_reclaimable="$reclaimable" ;;
+            "Local Volumes") volumes_size="$size" ;;
+        esac
+    done <<< "$QUERY_OUTPUT"
+    info_always "Rootful Podman storage: images ${images_size:-N/A} (reclaimable ${images_reclaimable:-N/A}), volumes ${volumes_size:-N/A}"
+    bytes=$(size_to_bytes "${images_reclaimable%% *}") || return 0
+    if [[ "$bytes" =~ ^[0-9]+$ ]] && (( bytes >= PODMAN_RECLAIMABLE_WARNING_BYTES )); then
+        warning "Rootful Podman: ${images_reclaimable} of images are not used by any container; review them with 'podman images' and prune unused ones"
+    fi
+}
 
-sngrep_pids=$(pgrep -x sngrep 2>/dev/null || true)
-if [[ -n "$sngrep_pids" ]]; then
+check_failed_system_services() {
+    local unit found=0
+    while read -r unit _; do
+        [[ -z "$unit" ]] && continue
+        problem "System unit ${unit} is failed"
+        found=1
+    done < <(systemctl list-units --failed --no-legend --no-pager --plain 2>/dev/null)
+    (( found )) || ok "No failed system services"
+}
+
+check_sngrep_instances() {
+    local sngrep_pids pid elapsed
+    sngrep_pids=$(pgrep -x sngrep 2>/dev/null || true)
+    if [[ -z "$sngrep_pids" ]]; then
+        ok "No sngrep instances found"
+        return 0
+    fi
     while read -r pid; do
         elapsed=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
         if [[ -n "$elapsed" && "$elapsed" -gt 86400 ]]; then
-            elapsed_days=$((elapsed / 86400))
-            problem "sngrep (PID $pid) running for ${elapsed_days} day(s)"
+            problem "sngrep (PID $pid) running for $((elapsed / 86400)) day(s)"
         else
             info "sngrep (PID $pid) running for less than 1 day"
         fi
     done <<< "$sngrep_pids"
-else
-    ok "No sngrep instances found"
-fi
+}
 
-# ---------------------------------------------------------------------------
-# 1b. Check /var/log/messages for common system errors
-# ---------------------------------------------------------------------------
-header "Check: /var/log/messages common errors"
+# Program name of a syslog line in traditional or RFC 3339 format.
+# shellcheck disable=SC2016
+SYSLOG_PROGRAM_AWK='{ p = ($1 ~ /^[0-9][0-9][0-9][0-9]-/) ? $3 : $5; sub(/\[.*$/, "", p); sub(/:$/, "", p); if (p != "") c[p]++ }
+    END { for (k in c) print c[k], k }'
 
-check_system_messages_log
+check_log_file_size() {
+    local log_file="${1:-/var/log/messages}" size top
+    [[ -f "$log_file" ]] || return 0
+    size=$(stat -c %s -- "$log_file" 2>/dev/null) || return 0
+    if (( size >= LOG_SIZE_WARNING_BYTES )); then
+        top=$(tail -c "$LOG_SCAN_MAX_BYTES" -- "$log_file" 2>/dev/null | tail -n "$LOG_SCAN_MAX_LINES" |
+            awk "$SYSLOG_PROGRAM_AWK" | sort -rn | head -3 | format_top_counts)
+        warning "${log_file} is $(human_bytes "$size") (>= $(human_bytes "$LOG_SIZE_WARNING_BYTES")); the bounded scan covers only its last $(human_bytes "$LOG_SCAN_MAX_BYTES")${top:+; top sources there: ${top}}"
+    else
+        info "${log_file} size: $(human_bytes "$size")"
+    fi
+}
 
-# ---------------------------------------------------------------------------
-# 2. List all modules on this node
-# ---------------------------------------------------------------------------
-header "Check: List all modules on this node"
-
-# NODE_ID is stored in /var/lib/nethserver/node/state/environment
-NODE_ID=$(grep -oP '^NODE_ID=\K.*' /var/lib/nethserver/node/state/environment 2>/dev/null || true)
-if [[ -z "$NODE_ID" ]]; then
-    # Fallback: extract from AGENT_ID in agent.env (e.g. "node/1" -> "1")
-    NODE_ID=$(grep -oP '^AGENT_ID=node/\K\d+' /var/lib/nethserver/node/state/agent.env 2>/dev/null || true)
-fi
-if [[ -z "$NODE_ID" ]]; then
-    problem "Cannot determine node ID (checked /var/lib/nethserver/node/state/environment and agent.env)"
-    NODE_ID="1"
-fi
-
-# Leader-node detection and multi-node info
-TOTAL_NODES=$(redis-cli --raw KEYS 'node/*/vpn' 2>/dev/null | wc -l || echo 1)
-IS_LEADER=0
-if [[ "$NODE_ID" == "1" ]]; then
-    IS_LEADER=1
-fi
-info "Node ${NODE_ID} of ${TOTAL_NODES} total node(s) (leader: $(if [[ $IS_LEADER -eq 1 ]]; then echo 'yes'; else echo 'no'; fi))"
-
-# Fetch installed modules from Redis (works on both leader and worker nodes).
-# Redis on workers runs as a replica — all cluster/* and module/* keys are
-# replicated from the leader, so read operations work everywhere.
-# Output format per line: id|source|version|module
-MODULES_ON_NODE=""
-_module_node_raw=$(redis-cli --raw HGETALL cluster/module_node 2>/dev/null || true)
-if [[ -n "$_module_node_raw" ]]; then
-    # HGETALL returns alternating key/value lines: module_id\nnode_id\n...
-    _prev_key=""
-    while IFS= read -r _line; do
-        if [[ -z "$_prev_key" ]]; then
-            _prev_key="$_line"
-        else
-            _mod_id="$_prev_key"
-            _mod_node="$_line"
-            _prev_key=""
-            # Only process modules on this node
-            [[ "$_mod_node" != "$NODE_ID" ]] && continue
-            # Get IMAGE_URL from module environment (</dev/null prevents redis-cli from consuming loop stdin)
-            _image_url=$(redis-cli --raw HGET "module/${_mod_id}/environment" IMAGE_URL </dev/null 2>/dev/null || true)
-            [[ -z "$_image_url" ]] && continue
-            # Parse: source = URL without tag, version = tag, module = last path component of source
-            _source="${_image_url%:*}"
-            _version="${_image_url##*:}"
-            _module="${_source##*/}"
-            MODULES_ON_NODE+="${_mod_id}|${_source}|${_version}|${_module}"$'\n'
+# Error-priority journal entries in a time window: report sources by count
+# and matching pattern names, never the records themselves.
+check_journal_errors() {
+    local out rc total identifiers top count ident pattern
+    if ! command -v journalctl >/dev/null 2>&1; then
+        info "journalctl is not available; journal scan skipped"
+        return 0
+    fi
+    if fetch_query journal; then
+        out="${QUERY_OUTPUT%$'\n'}"
+        rc="$QUERY_RC"
+    else
+        out=$(journal_errors_command)
+        rc=$?
+    fi
+    if [[ "$rc" != 0 && -z "$out" ]]; then
+        warning "Could not read error-priority journal entries"
+        return 0
+    fi
+    if [[ -z "$out" ]]; then
+        ok "No error-priority journal entries in the last ${JOURNAL_SCAN_HOURS}h"
+        return 0
+    fi
+    total=$(wc -l <<< "$out")
+    # short-unix: "<timestamp> <host> <identifier>[pid]: message"
+    identifiers=$(awk '{ i = $3; sub(/\[.*$/, "", i); sub(/:$/, "", i); if (i != "") c[i]++ }
+        END { for (k in c) print c[k], k }' <<< "$out" | sort -rn)
+    top=$(head -3 <<< "$identifiers" | format_top_counts)
+    info "Journal: ${total} error-priority entries in the last ${JOURNAL_SCAN_HOURS}h (limit ${LOG_SCAN_MAX_LINES}); top sources: ${top}"
+    while read -r count ident; do
+        if [[ "$count" =~ ^[0-9]+$ ]] && (( count >= JOURNAL_NOISY_SOURCE_COUNT )); then
+            warning "Journal: ${ident} logged ${count} error-priority entries in the last ${JOURNAL_SCAN_HOURS}h"
         fi
-    done <<< "$_module_node_raw"
-    # Sort and strip trailing newline
-    MODULES_ON_NODE=$(echo "$MODULES_ON_NODE" | sort | sed '/^$/d')
-else
-    warning "Cannot retrieve installed modules from Redis"
-fi
-
-# Plain list of module IDs for later checks
-MODULES=$(echo "$MODULES_ON_NODE" | cut -d'|' -f1 | grep -v '^$' || true)
-
-if [[ -z "$MODULES" ]]; then
-    warning "No modules found on node ${NODE_ID}"
-else
-    info "Modules on node ${NODE_ID}:"
-    while IFS='|' read -r mod_id mod_source mod_version mod_name; do
-        info "  - ${mod_id} (${mod_name}) version ${mod_version}"
-    done <<< "$MODULES_ON_NODE"
-fi
-
-# Resolve every local module once, then report home filesystems after discovery.
-resolve_local_module_paths
-header "General System Data: Module home filesystems"
-report_module_home_filesystems
+    done <<< "$identifiers"
+    while IFS= read -r pattern; do
+        [[ -z "$pattern" ]] && continue
+        problem "Journal error entries (last ${JOURNAL_SCAN_HOURS}h) contain common error pattern: ${pattern}"
+    done < <(match_log_patterns "$MESSAGES_LOG_ERROR_PATTERNS" <<< "$out")
+    return 0
+}
 
 # ---------------------------------------------------------------------------
-# 3. Module version vs latest GitHub release
+# Cluster checks
 # ---------------------------------------------------------------------------
-header "Check: Module version vs latest GitHub release"
+check_wireguard_peers() {
+    local dump
+    if ! command -v wg >/dev/null 2>&1; then
+        info "wg command not available; cluster VPN checks skipped"
+        return 0
+    fi
+    if ! ip link show wg0 >/dev/null 2>&1; then
+        info "No wg0 interface; cluster VPN checks skipped"
+        return 0
+    fi
+    if ! dump=$(timeout 10s wg show wg0 dump </dev/null 2>/dev/null); then
+        warning "Cannot read WireGuard wg0 peer status"
+        return 0
+    fi
+    evaluate_wireguard_peers "$dump" "$(date +%s)"
+}
 
-if [[ $INTERNET_OK -eq 0 ]]; then
-    warning "Skipping GitHub version checks (no internet connectivity)"
-else
+# $1: "wg show wg0 dump" output (interface line, then one tab-separated line
+# per peer); $2: current epoch. Peers are named by matching VPN addresses.
+evaluate_wireguard_peers() {
+    local dump="$1" now="$2" first=1 total=0 healthy=0
+    local pubkey allowed handshake ip node label age
+    local -a ips=()
+    local -A peered=()
+    while IFS=$'\t' read -r pubkey _ _ allowed handshake _; do
+        if (( first )); then first=0; continue; fi
+        [[ -z "$pubkey" ]] && continue
+        ((total++))
+        label=""
+        IFS=, read -r -a ips <<< "$allowed"
+        for ip in "${ips[@]}"; do
+            ip="${ip%/32}"
+            node="${VPN_IP_NODE[$ip]:-}"
+            if [[ -n "$node" ]]; then
+                label+="${label:+, }node ${node} (${ip})"
+                peered["$node"]=1
+            fi
+        done
+        [[ -z "$label" ]] && label="peer ${allowed:-without allowed IPs}"
+        if [[ ! "$handshake" =~ ^[0-9]+$ || "$handshake" == 0 ]]; then
+            problem "Cluster VPN: ${label} never completed a WireGuard handshake (node down or stale)"
+            continue
+        fi
+        age=$(( now - handshake ))
+        if (( age > WG_HANDSHAKE_MAX_AGE )); then
+            problem "Cluster VPN: ${label} last WireGuard handshake $(format_duration "$age") ago (node down or stale)"
+        else
+            ((healthy++))
+            info "Cluster VPN: ${label} handshake $(format_duration "$age") ago"
+        fi
+    done <<< "$dump"
+    # The leader peers with every node; workers need not peer with each other.
+    if (( IS_LEADER )); then
+        for node in "${!NODE_VPN_IP[@]}"; do
+            [[ "$node" == "$NODE_ID" || -n "${peered[$node]+x}" ]] && continue
+            warning "Cluster VPN: node ${node} is registered in Redis but has no WireGuard peer on the leader"
+        done
+    fi
+    if (( total == 0 )); then
+        info "Cluster VPN: no WireGuard peers"
+    elif (( healthy == total )); then
+        ok "Cluster VPN: all ${total} WireGuard peer(s) have a recent handshake"
+    fi
+    return 0
+}
 
-check_module_version() {
-    local mod_id="$1"
-    local mod_source="$2"
-    local mod_version="$3"
-    local mod_name="$4"
+check_redis_replication() {
+    local out link io
+    out=$(redis-cli info replication </dev/null 2>/dev/null | tr -d '\r')
+    link=$(sed -n 's/^master_link_status://p' <<< "$out")
+    io=$(sed -n 's/^master_last_io_seconds_ago://p' <<< "$out")
+    if [[ "$link" == up ]]; then
+        ok "Redis replica is connected to the leader (last I/O ${io:-?}s ago)"
+    else
+        problem "Redis replica link to the leader is ${link:-unknown}: cluster data on this node may be stale"
+    fi
+}
+
+backup_interval_seconds() {
+    case "$1" in
+        hourly) echo 3600 ;;
+        daily) echo 86400 ;;
+        weekly) echo 604800 ;;
+        monthly) echo 2678400 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Backups are cluster objects ("cluster/backup/<id>": name, enabled,
+# instances, schedule_hint); per-module results are in
+# "node/<node>/backup_status/<id>" as JSON with start, end and errors.
+check_backups() {
+    local keys key bid hint mid enabled_text existing stale status errors end interval max_age now found disabled_names label
+    local -a bids=() values=() mods=() flags=() statuses=() requests=()
+    local -A backup_name=() backup_enabled=() backup_instances=() backup_interval=() status_of=()
+    local i request
+    if ! keys=$(redis-cli --raw --scan --pattern 'cluster/backup/*' </dev/null 2>/dev/null); then
+        warning "Cannot read backup configuration from Redis"
+        return 0
+    fi
+    while IFS= read -r key; do
+        bid="${key#cluster/backup/}"
+        [[ "$bid" =~ ^[0-9]+$ ]] && bids+=("$bid")
+    done <<< "$keys"
+    if (( ${#bids[@]} > 0 )); then
+        mapfile -t values < <(for bid in "${bids[@]}"; do
+            printf 'HGET cluster/backup/%s %s\n' "$bid" name "$bid" enabled "$bid" instances "$bid" schedule_hint
+        done | redis_batch)
+    fi
+    for i in "${!bids[@]}"; do
+        bid="${bids[$i]}"
+        backup_name["$bid"]="${values[$((i * 4))]:-}"
+        enabled_text="${values[$((i * 4 + 1))]:-}"
+        # list-backups treats any non-empty value as enabled.
+        if [[ -n "$enabled_text" && "$enabled_text" != 0 ]]; then backup_enabled["$bid"]=1; else backup_enabled["$bid"]=0; fi
+        backup_instances["$bid"]=" $(xargs <<< "${values[$((i * 4 + 2))]:-}") "
+        hint="${values[$((i * 4 + 3))]:-}"
+        backup_interval["$bid"]=$(grep -oP '"interval"\s*:\s*"\K[^"]+' <<< "$hint")
+    done
+
+    # Cluster-wide backup definitions are reported once, by the leader.
+    if (( IS_LEADER )); then
+        (( ${#bids[@]} == 0 )) && warning "No backup is configured in the cluster"
+        for bid in "${bids[@]}"; do
+            existing=0
+            stale=""
+            for mid in ${backup_instances[$bid]}; do
+                if [[ -n "${CLUSTER_MODULE_NODE[$mid]+x}" ]]; then ((existing++)); else stale+="${stale:+ }${mid}"; fi
+            done
+            [[ -n "$stale" ]] && warning "Backup '${backup_name[$bid]}' (id ${bid}) references removed module(s): ${stale}"
+            if (( backup_enabled[$bid] && existing == 0 )); then
+                warning "Backup '${backup_name[$bid]}' (id ${bid}) is enabled but includes no installed module"
+            fi
+        done
+    fi
+
+    now=$(date +%s)
+    # Fetch opt-out flags and all relevant statuses in two Redis round trips.
+    mapfile -t mods < <(sed '/^$/d' <<< "$MODULES")
+    (( ${#mods[@]} > 0 )) || return 0
+    mapfile -t flags < <(printf 'SISMEMBER module/%s/flags no_data_backup\n' "${mods[@]}" | redis_batch)
+    for mid in "${mods[@]}"; do
+        for bid in "${bids[@]}"; do
+            [[ "${backup_instances[$bid]}" == *" ${mid} "* ]] && requests+=("$bid $mid")
+        done
+    done
+    if (( ${#requests[@]} > 0 )); then
+        mapfile -t statuses < <(for request in "${requests[@]}"; do
+            printf 'HGET node/%s/backup_status/%s %s\n' "$NODE_ID" "${request%% *}" "${request#* }"
+        done | redis_batch)
+        for i in "${!requests[@]}"; do
+            status_of["${requests[$i]}"]="${statuses[$i]:-}"
+        done
+    fi
+    for i in "${!mods[@]}"; do
+        mid="${mods[$i]}"
+        [[ "${flags[$i]:-0}" == 1 ]] && continue
+        found=0
+        disabled_names=""
+        for bid in "${bids[@]}"; do
+            [[ "${backup_instances[$bid]}" == *" ${mid} "* ]] || continue
+            if (( ! backup_enabled[$bid] )); then
+                disabled_names+="${disabled_names:+, }'${backup_name[$bid]}'"
+                continue
+            fi
+            found=1
+            label="${mid}: backup '${backup_name[$bid]}' (id ${bid})"
+            status="${status_of["$bid $mid"]:-}"
+            if [[ -z "$status" ]]; then
+                warning "${label} has never completed on this node"
+                continue
+            fi
+            errors=$(grep -oP '"errors"\s*:\s*\K[0-9]+' <<< "$status")
+            end=$(grep -oP '"end"\s*:\s*\K[0-9]+' <<< "$status")
+            if [[ "$errors" =~ ^[0-9]+$ ]] && (( errors > 0 )); then
+                problem "${label}: last run failed with ${errors} error(s)"
+            elif [[ ! "$end" =~ ^[0-9]+$ ]]; then
+                info "${label}: last run has no end time (possibly running)"
+            elif interval=$(backup_interval_seconds "${backup_interval[$bid]}") &&
+                max_age=$(( 2 * interval + BACKUP_AGE_GRACE_SECONDS )) && (( now - end > max_age )); then
+                warning "${label}: last run completed $(format_duration $(( now - end ))) ago (schedule: ${backup_interval[$bid]})"
+            else
+                ok "${label}: last run completed $(format_duration $(( now > end ? now - end : 0 ))) ago"
+            fi
+        done
+        if (( ! found )); then
+            warning "${mid}: not included in any enabled backup${disabled_names:+ (only in disabled ${disabled_names})}"
+        fi
+    done
+    return 0
+}
+
+# Directories named like module IDs, with NS8 module state, whose module no
+# longer exists in the cluster. Bases are /home plus parents of module homes,
+# unless base directories are given as arguments.
+# shellcheck disable=SC2120
+check_orphan_module_homes() {
+    local -a bases=("$@") orphans=()
+    local -A seen=()
+    local base dir name owner owner_uid size detail mod i found=0
+    if (( ${#CLUSTER_MODULE_NODE[@]} == 0 )); then
+        info "Cluster module inventory unavailable; leftover module home check skipped"
+        return 0
+    fi
+    if (( ${#bases[@]} == 0 )); then
+        [[ -d /home ]] && bases+=(/home)
+        for mod in "${!MODULE_HOMES[@]}"; do
+            bases+=("$(dirname -- "${MODULE_HOMES[$mod]}")")
+        done
+    fi
+    for base in "${bases[@]}"; do
+        [[ -n "${seen[$base]+x}" ]] && continue
+        seen["$base"]=1
+        for dir in "$base"/*; do
+            [[ -d "$dir" && ! -L "$dir" ]] || continue
+            name="${dir##*/}"
+            [[ "$name" =~ ^[a-z][a-z0-9-]*[0-9]+$ ]] || continue
+            [[ -n "${CLUSTER_MODULE_NODE[$name]+x}" ]] && continue
+            [[ -d "$dir/.config/state" || -d "$dir/.local/share/containers" || -d "$dir/.config/systemd" ]] || continue
+            orphans+=("$dir")
+            # Sizes are computed in parallel; large homes may hit the timeout.
+            start_query "du.${#orphans[@]}" timeout 20s du -sxh -- "$dir"
+        done
+    done
+    for i in "${!orphans[@]}"; do
+        dir="${orphans[$i]}"
+        name="${dir##*/}"
+        owner=$(stat -c %U -- "$dir" 2>/dev/null)
+        owner_uid=$(stat -c %u -- "$dir" 2>/dev/null)
+        if fetch_query "du.$((i + 1))"; then
+            size=$(cut -f1 <<< "$QUERY_OUTPUT")
+        else
+            size=$(timeout 20s du -sxh -- "$dir" 2>/dev/null | cut -f1)
+        fi
+        detail="size ${size:-unknown}"
+        if [[ "$owner" == UNKNOWN ]]; then
+            detail+=", owner UID ${owner_uid} has no account"
+        elif [[ -n "$owner" && "$owner" != "$name" ]]; then
+            detail+=", owner UID ${owner_uid} now belongs to ${owner}"
+        fi
+        warning "Leftover home of removed module ${name}: ${dir} (${detail}); verify and remove it"
+        found=1
+    done
+    (( found )) || ok "No leftover homes of removed modules found"
+    return 0
+}
+
+check_software_repositories() {
+    local key enabled=0 total=0 disabled="" i
+    local -a names=() values=()
+    while IFS= read -r key; do
+        [[ "$key" == cluster/repository/* ]] && names+=("${key#cluster/repository/}")
+    done < <(redis-cli --raw --scan --pattern 'cluster/repository/*' </dev/null 2>/dev/null)
+    total=${#names[@]}
+    if (( total > 0 )); then
+        mapfile -t values < <(for key in "${names[@]}"; do
+            printf 'HGET cluster/repository/%s status\nHGET cluster/repository/%s testing\n' "$key" "$key"
+        done | redis_batch)
+    fi
+    for i in "${!names[@]}"; do
+        if [[ "${values[$((i * 2))]:-}" == 1 ]]; then
+            ((enabled++))
+            [[ "${values[$((i * 2 + 1))]:-}" == 1 ]] && info "Software repository ${names[$i]} has testing releases enabled"
+        else
+            disabled+="${disabled:+, }${names[$i]}"
+        fi
+    done
+    if (( total == 0 )); then
+        warning "No software repository is configured: NS8 cannot offer module or core updates"
+    elif (( enabled == 0 )); then
+        warning "No software repository is enabled (disabled: ${disabled}): NS8 cannot offer module or core updates"
+    else
+        ok "${enabled} of ${total} software repositories enabled${disabled:+ (disabled: ${disabled})}"
+    fi
+}
+
+# Updates as NS8 computes them (repositories, testing flags, min-core).
+check_ns8_updates() {
+    local core_image out lines id node version update testing found=0
+    core_image=$(redis-cli --raw HGET "node/${NODE_ID}/environment" IMAGE_URL </dev/null 2>/dev/null)
+    [[ -n "$core_image" ]] && info_always "NS8 core version on node ${NODE_ID}: ${core_image##*:}"
+    if (( ! IS_LEADER )); then
+        info "NS8 update availability is computed on the leader node; skipped on this worker"
+        return 0
+    fi
+    if (( OFFLINE )); then
+        info "NS8 update listing skipped (--offline)"
+        return 0
+    fi
+    if ! command -v api-cli >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+        info "api-cli or jq is not available; NS8 update listing skipped"
+        return 0
+    fi
+    if out=$(timeout 120s api-cli run cluster/list-updates </dev/null 2>/dev/null) &&
+        lines=$(jq -r '.[] | [.id, (.node // "" | tostring), (.version // ""), (.update // ""), (.testing_update // "")] | join("|")' <<< "$out" 2>/dev/null); then
+        while IFS='|' read -r id node version update testing; do
+            [[ -z "$id" ]] && continue
+            if [[ -n "$update" ]]; then
+                warning "${id} (node ${node}): NS8 update available ${version} -> ${update}"
+                found=1
+            elif [[ -n "$testing" ]]; then
+                info "${id} (node ${node}): testing release ${testing} available"
+            fi
+        done <<< "$lines"
+    else
+        warning "Cannot list NS8 module updates (cluster/list-updates)"
+    fi
+    if out=$(timeout 120s api-cli run cluster/list-core-modules </dev/null 2>/dev/null) &&
+        lines=$(jq -r '.[] | .instances[]? | select((.update // "") != "") | [.id, (.node // "" | tostring), (.version // ""), .update] | join("|")' <<< "$out" 2>/dev/null); then
+        while IFS='|' read -r id node version update; do
+            [[ -z "$id" ]] && continue
+            warning "${id}${node:+ (node ${node})}: NS8 core update available ${version} -> ${update}"
+            found=1
+        done <<< "$lines"
+    else
+        warning "Cannot list NS8 core module updates (cluster/list-core-modules)"
+    fi
+    (( found )) || ok "No module or core updates offered by the enabled repositories"
+}
+
+check_subscription_status() {
+    local out fields status expires expire_date expire_epoch now days
+    [[ -n "$SUBSCRIPTION_SYSTEM_ID" ]] || return 0
+    if (( ! IS_LEADER )); then
+        info "Subscription status is checked on the leader node"
+        return 0
+    fi
+    if (( OFFLINE )); then
+        info "Subscription status check skipped (--offline)"
+        return 0
+    fi
+    if ! command -v api-cli >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+        info "api-cli or jq is not available; subscription status check skipped"
+        return 0
+    fi
+    # The action queries the provider; read only status and expiry fields.
+    if ! out=$(timeout 60s api-cli run cluster/get-subscription </dev/null 2>/dev/null) ||
+        ! fields=$(jq -r '(.subscription // .) | [(.status // ""), ((.expires // false) | tostring), ((.expire_date // "") | tostring)] | join("|")' <<< "$out" 2>/dev/null); then
+        warning "Cannot read subscription status (cluster/get-subscription)"
+        return 0
+    fi
+    IFS='|' read -r status expires expire_date <<< "$fields"
+    if [[ "$status" == active ]]; then
+        ok "Subscription status is active"
+    else
+        warning "Subscription status is ${status:-unknown}"
+    fi
+    [[ "$expires" == true && -n "$expire_date" && "$expire_date" != -1 ]] || return 0
+    if [[ "$expire_date" =~ ^[0-9]{13}$ ]]; then
+        expire_epoch=$(( expire_date / 1000 ))
+    elif [[ "$expire_date" =~ ^[0-9]+$ ]]; then
+        expire_epoch="$expire_date"
+    else
+        expire_epoch=$(date -d "$expire_date" +%s 2>/dev/null)
+    fi
+    if [[ ! "$expire_epoch" =~ ^[0-9]+$ ]]; then
+        info "Subscription expiry date ${expire_date} could not be parsed"
+        return 0
+    fi
+    now=$(date +%s)
+    days=$(( (expire_epoch - now) / 86400 ))
+    if (( expire_epoch < now )); then
+        problem "Subscription expired on ${expire_date}"
+    elif (( days < SUBSCRIPTION_EXPIRY_WARNING_DAYS )); then
+        warning "Subscription expires in ${days} day(s) (${expire_date})"
+    else
+        info "Subscription valid until ${expire_date}"
+    fi
+}
+
+check_cluster_smarthost() {
+    local enabled host
+    { IFS= read -r enabled; IFS= read -r host; } < <(
+        printf 'HGET cluster/smarthost enabled\nHGET cluster/smarthost host\n' | redis_batch)
+    if [[ "$enabled" == 1 ]]; then
+        ok "Cluster smarthost is enabled (${host:-host not set})"
+    else
+        warning "Cluster smarthost is not enabled: NethVoice voicemail-to-email and report emails may not be delivered"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# NethVoice and proxy checks
+# ---------------------------------------------------------------------------
+check_nethvoice_dns() {
+    local nv_mod="$1" dns_start dns_out dns_end dns_ms line
+    dns_start=$(date +%s%N)
+    dns_out=$(runagent -m "$nv_mod" podman exec freepbx getent hosts ibm.com </dev/null 2>&1 || true)
+    dns_end=$(date +%s%N)
+    dns_ms=$(( (dns_end - dns_start) / 1000000 ))
+
+    if [[ -z "$dns_out" || "$dns_ms" -gt $DNS_SLOW_MS ]]; then
+        problem "${nv_mod}: DNS resolution failed or too slow (${dns_ms}ms, getent hosts ibm.com)"
+        info "${nv_mod}: /etc/resolv.conf inside container freepbx:"
+        runagent -m "$nv_mod" podman exec freepbx cat /etc/resolv.conf </dev/null 2>/dev/null | while read -r line; do
+            echo "  ${line}"
+        done
+    else
+        ok "${nv_mod}: DNS OK (ibm.com resolved in ${dns_ms}ms)"
+    fi
+}
+
+check_nethvoice_call_forwards() {
+    local nv_mod="$1" cf_out cf_mappings cf_ext cf_dest cf_target start_ext current_ext next_ext
+    local cycle_start_index cycle_ext cycle_desc
+    local -a cf_path=() cycle_exts=()
+    local -A cf_targets=() reported_cf_cycles=() visited_cf=()
+
+    if ! cf_out=$(freepbx_section "$nv_mod" cf); then
+        info "${nv_mod}: could not retrieve AstDB CF entries"
+        return 0
+    fi
+    # Parse AstDB output lines like:
+    #   /CF/200                                       : 210
+    # and keep a unique extension|destination mapping for later checks.
+    cf_mappings=$(echo "$cf_out" | awk '
+        /^[[:space:]]*\/CF\// {
+            line = $0
+            sub(/^[[:space:]]*\/CF\//, "", line)
+            split(line, parts, /[[:space:]]*:[[:space:]]*/)
+            ext = parts[1]
+            dest = parts[2]
+            sub(/[[:space:]].*$/, "", ext)
+            sub(/^[[:space:]]+/, "", dest)
+            sub(/[[:space:]]+$/, "", dest)
+            if (ext != "") {
+                print ext "|" dest
+            }
+        }
+    ' | sort -u)
+
+    if [[ -z "$cf_mappings" ]]; then
+        ok "${nv_mod}: no extensions with call forward enabled (AstDB CF)"
+        return 0
+    fi
+
+    while IFS='|' read -r cf_ext cf_dest; do
+        [[ -z "$cf_ext" ]] && continue
+        # Keep only a numeric extension target so we can walk CF chains.
+        # If the destination is external or non-numeric, the extension still
+        # gets a warning but it is not considered for circular-chain checks.
+        cf_target=""
+        if [[ "$cf_dest" =~ ^[0-9]+$ ]]; then
+            cf_target="$cf_dest"
+        elif [[ "$cf_dest" =~ (^|[^0-9])([0-9]{2,})([^0-9]|$) ]]; then
+            cf_target="${BASH_REMATCH[2]}"
+        fi
+        cf_targets["$cf_ext"]="$cf_target"
+        warning "${nv_mod}: Extension ${cf_ext} has call forward enabled"
+    done <<< "$cf_mappings"
+
+    # Follow each extension CF chain until it ends or loops back to a
+    # previously visited extension. A repeated node means a circular CF.
+    for start_ext in "${!cf_targets[@]}"; do
+        visited_cf=()
+        cf_path=()
+        current_ext="$start_ext"
+        while [[ -n "$current_ext" && -n "${cf_targets[$current_ext]+x}" ]]; do
+            if [[ -n "${visited_cf[$current_ext]+x}" ]]; then
+                cycle_start_index=${visited_cf[$current_ext]}
+                cycle_exts=( "${cf_path[@]:$cycle_start_index}" )
+                cycle_desc=""
+                for cycle_ext in "${cycle_exts[@]}"; do
+                    [[ -n "$cycle_desc" ]] && cycle_desc+=" -> "
+                    cycle_desc+="$cycle_ext"
+                done
+                cycle_desc+=" -> ${current_ext}"
+                for cycle_ext in "${cycle_exts[@]}"; do
+                    if [[ -z "${reported_cf_cycles[$cycle_ext]+x}" ]]; then
+                        problem "${nv_mod}: Extension ${cycle_ext} has circular call forward configuration (${cycle_desc})"
+                        reported_cf_cycles["$cycle_ext"]=1
+                    fi
+                done
+                break
+            fi
+            visited_cf["$current_ext"]=${#cf_path[@]}
+            cf_path+=("$current_ext")
+            next_ext="${cf_targets[$current_ext]}"
+            [[ -z "$next_ext" ]] && break
+            current_ext="$next_ext"
+        done
+    done
+    return 0
+}
+
+check_nethvoice_queue_strategy() {
+    local nv_mod="$1" queue_out ringall_queue_agents ringall_queue_count queue_name queue_agents
+    local max_ringall_agents=0 max_ringall_queue="" ringall_over_limit=""
+
+    if ! queue_out=$(freepbx_section "$nv_mod" queues) || [[ -z "$queue_out" ]]; then
+        info "${nv_mod}: could not retrieve queue strategy data (Asterisk queue show unavailable)"
+        return 0
+    fi
+    # Parse `queue show` output queue-by-queue and count members only for
+    # queues whose strategy is explicitly set to `ringall`.
+    ringall_queue_agents=$(echo "$queue_out" | awk -v sq="'" '
+        BEGIN { queue = ""; is_ringall = 0; in_members = 0; agents = 0 }
+        function flush_queue() {
+            if (is_ringall && queue != "") {
+                print queue "|" agents
+            }
+        }
+        /^[^[:space:]].* has .* strategy/ {
+            flush_queue()
+            queue = ""
+            is_ringall = 0
+            in_members = 0
+            agents = 0
+            if (match($0, /^(.+) has .* in /, m)) {
+                queue = m[1]
+            }
+            if (index($0, " in " sq "ringall" sq " strategy") > 0) {
+                is_ringall = 1
+            }
+            next
+        }
+        is_ringall && /^[[:space:]]+Members:[[:space:]]*$/ { in_members = 1; next }
+        is_ringall && /^[[:space:]]+Callers:[[:space:]]*$/ { in_members = 0; next }
+        is_ringall && in_members {
+            if ($0 ~ /^[[:space:]]+[^[:space:]]+/ && $0 !~ /^[[:space:]]+No Members/) {
+                agents++
+            }
+            next
+        }
+        END { flush_queue() }
+    ')
+
+    ringall_queue_count=$(echo "$ringall_queue_agents" | sed '/^$/d' | wc -l)
+    if [[ -n "$ringall_queue_agents" ]]; then
+        # Evaluate both warning conditions:
+        # 1. too many queues using ringall
+        # 2. any ringall queue with too many agents
+        while IFS='|' read -r queue_name queue_agents; do
+            [[ -z "$queue_name" ]] && continue
+            [[ -z "$queue_agents" || ! "$queue_agents" =~ ^[0-9]+$ ]] && queue_agents=0
+            if (( queue_agents > max_ringall_agents )); then
+                max_ringall_agents=$queue_agents
+                max_ringall_queue=$queue_name
+            fi
+            if (( queue_agents > QUEUE_RINGALL_MAX_AGENTS )); then
+                ringall_over_limit+="${queue_name}(${queue_agents}) "
+            fi
+        done <<< "$ringall_queue_agents"
+    fi
+
+    if (( ringall_queue_count > QUEUE_RINGALL_MAX_QUEUES )) || [[ -n "$ringall_over_limit" ]]; then
+        warning "${nv_mod}: Asterisk ringall strategy may overload endpoints (ringall queues: ${ringall_queue_count}, threshold: ${QUEUE_RINGALL_MAX_QUEUES}; queues with >${QUEUE_RINGALL_MAX_AGENTS} agents: ${ringall_over_limit:-none})"
+    elif (( ringall_queue_count > 0 )); then
+        info "${nv_mod}: ringall queues: ${ringall_queue_count} (max agents in a ringall queue: ${max_ringall_agents}${max_ringall_queue:+ in ${max_ringall_queue}})"
+    else
+        ok "${nv_mod}: no queues using ringall strategy"
+    fi
+}
+
+# kamcmd dispatcher.list: each destination has "URI:" then "FLAGS:"; the
+# first flag is A(ctive), I(nactive), D(isabled), T(rying) or P(robing).
+evaluate_dispatcher_destinations() {
+    local proxy_mod="$1" output="$2" line uri="" flags count=0
+    while IFS= read -r line; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        case "$line" in
+            URI:*)
+                uri="${line#URI:}"
+                uri="${uri#"${uri%%[![:space:]]*}"}"
+                ;;
+            FLAGS:*)
+                flags="${line#FLAGS:}"
+                flags="${flags//[[:space:]]/}"
+                ((count++))
+                case "${flags:0:1}" in
+                    A) ok "${proxy_mod}: dispatcher destination ${uri} is active (${flags})" ;;
+                    I) problem "${proxy_mod}: dispatcher destination ${uri} is inactive (${flags}): the proxy cannot reach this NethVoice instance" ;;
+                    D) problem "${proxy_mod}: dispatcher destination ${uri} is disabled (${flags})" ;;
+                    *) warning "${proxy_mod}: dispatcher destination ${uri} state is ${flags:-unknown} (probing)" ;;
+                esac
+                ;;
+        esac
+    done <<< "$output"
+    (( count )) || warning "${proxy_mod}: Kamailio dispatcher has no destinations"
+    return 0
+}
+
+check_nethvoice_proxy_runtime() {
+    local proxy_mod="$1" output total proxy_public
+    collect_proxy_snapshot "$proxy_mod"
+    if output=$(snapshot_section "proxy:$proxy_mod" dispatcher); then
+        evaluate_dispatcher_destinations "$proxy_mod" "$output"
+    else
+        warning "${proxy_mod}: cannot read Kamailio dispatcher destinations"
+    fi
+    if output=$(snapshot_section "proxy:$proxy_mod" rtpengine); then
+        total=$(sed -nE 's/^Current sessions total: *([0-9]+).*/\1/p' <<< "$output")
+        ok "${proxy_mod}: RTPengine answers (${total:-unknown} active session(s))"
+    else
+        problem "${proxy_mod}: RTPengine control interface does not answer (media relay may be down)"
+    fi
+    # A stale PUBLIC_IP is advertised in SDP and causes one-way or no audio.
+    if [[ "$PUBLIC_IP_SOURCE" == lookup ]] && resolve_module_paths "$proxy_mod"; then
+        proxy_public=$(get_env_var "${MODULE_ENV_FILES[$proxy_mod]}" PUBLIC_IP)
+        if [[ -n "$proxy_public" && "$proxy_public" != "$PUBLIC_IP" ]]; then
+            warning "${proxy_mod}: configured PUBLIC_IP ${proxy_public} differs from the detected public IP ${PUBLIC_IP} (risk of one-way or missing audio)"
+        elif [[ -n "$proxy_public" ]]; then
+            ok "${proxy_mod}: configured PUBLIC_IP matches the detected public IP"
+        fi
+    fi
+}
+
+check_nethvoice_module() {
+    local nv_mod="$1"
+    info "Checking NethVoice module: ${nv_mod}"
+    check_nethvoice_dns "$nv_mod"
+    check_nethvoice_mysqlcheck "$nv_mod"
+    check_nethvoice_localnets "$nv_mod"
+    check_nethvoice_need_reload "$nv_mod"
+    check_nethvoice_email_from_address "$nv_mod"
+    check_nethvoice_asterisk_full_logs "$nv_mod"
+    check_nethvoice_proxy_domain_uri "$nv_mod"
+    check_nethvoice_certificate "$nv_mod"
+    check_nethvoice_asterisk_runtime "$nv_mod"
+    check_nethvoice_pjsip_contacts "$nv_mod"
+    check_nethvoice_pjsip_endpoints "$nv_mod"
+    check_nethvoice_trunk_registrations "$nv_mod"
+    check_nethvoice_long_channels "$nv_mod"
+    check_nethvoice_astdb_cidname "$nv_mod"
+    check_nethvoice_call_forwards "$nv_mod"
+    check_nethvoice_queue_strategy "$nv_mod"
+    check_nethvoice_asterisk_port_alignment "$nv_mod"
+}
+
+# Runs in the CrowdSec module context with local addresses as arguments.
+CROWDSEC_QUERY_SCRIPT=$(cat <<'EOF'
+container=$(podman ps --format '{{.Names}}' | grep -i crowdsec | head -1)
+[ -n "$container" ] || exit 4
+podman exec -i "$container" sh -s -- "$@" <<'INNER'
+for ip; do
+    result=$(cscli decisions list -i "$ip" -o raw 2>/dev/null | tail -n +2 | head -1)
+    [ -z "$result" ] || printf '%s\t%s\n' "$ip" "$result"
+done
+INNER
+EOF
+)
+
+check_crowdsec() {
+    local cs_mod output rc ip result blocked_found=0
+    local -a local_ips=()
+    cs_mod=$(get_modules_by_name crowdsec | head -1)
+    if [[ -z "$cs_mod" ]]; then
+        info "No CrowdSec module found, skipping"
+        return 0
+    fi
+    warning "CrowdSec module found: ${cs_mod} (may cause connectivity issues)"
+    mapfile -t local_ips < <(ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 |
+        grep -v '^127\.' | grep -v '^::1$' | sort -u)
+    if (( ${#local_ips[@]} == 0 )); then
+        warning "Could not determine local IP addresses"
+        return 0
+    fi
+    output=$(timeout 60s runagent -m "$cs_mod" sh -c "$CROWDSEC_QUERY_SCRIPT" sh "${local_ips[@]}" </dev/null 2>/dev/null)
+    rc=$?
+    if [[ "$rc" == 4 ]]; then
+        warning "CrowdSec container not found in module ${cs_mod}"
+        return 0
+    elif [[ "$rc" != 0 && -z "$output" ]]; then
+        warning "Cannot query CrowdSec decisions in module ${cs_mod}"
+        return 0
+    fi
+    while IFS=$'\t' read -r ip result; do
+        [[ -z "$ip" ]] && continue
+        problem "CrowdSec: local IP ${ip} is BLOCKED"
+        echo "  ${result}"
+        blocked_found=1
+    done <<< "$output"
+    (( blocked_found )) || ok "CrowdSec: no local IPs are blocked (checked ${#local_ips[@]} addresses)"
+}
+
+# ---------------------------------------------------------------------------
+# Sections
+# ---------------------------------------------------------------------------
+check_module_version_github() {
+    local mod_id="$1" mod_source="$2" mod_version="$3" mod_name="$4"
+    local image_path org github_repo latest_tag
 
     if [[ -z "$mod_source" || -z "$mod_version" ]]; then
         warning "${mod_id}: missing source or version info"
@@ -1674,11 +2970,10 @@ check_module_version() {
     # Derive GitHub repo from source image URL
     # e.g. ghcr.io/nethserver/traefik -> nethserver/ns8-traefik
     # e.g. ghcr.io/nethesis/nethvoice -> nethesis/ns8-nethvoice
-    local image_path="${mod_source#*/}"    # drop registry host (ghcr.io/)
-    local org="${image_path%%/*}"          # e.g. "nethserver" or "nethesis"
-    local github_repo="${org}/ns8-${mod_name}"
+    image_path="${mod_source#*/}"    # drop registry host (ghcr.io/)
+    org="${image_path%%/*}"          # e.g. "nethserver" or "nethesis"
+    github_repo="${org}/ns8-${mod_name}"
 
-    local latest_tag
     latest_tag=$(curl -sf --max-time 10 \
         "https://api.github.com/repos/${github_repo}/releases/latest" \
         | grep -oP '"tag_name"\s*:\s*"\K[^"]+' || true)
@@ -1695,444 +2990,388 @@ check_module_version() {
     fi
 }
 
-if [[ -n "$MODULES_ON_NODE" ]]; then
-    while IFS='|' read -r mod_id mod_source mod_version mod_name; do
-        check_module_version "$mod_id" "$mod_source" "$mod_version" "$mod_name"
-    done <<< "$MODULES_ON_NODE"
-else
-    info "No modules to check"
-fi
-
-fi  # end INTERNET_OK check
-
-# ---------------------------------------------------------------------------
-# 3b. Per-module container health overview
-# ---------------------------------------------------------------------------
-header "Check: Container health per module"
-
-if [[ -n "$MODULES" ]]; then
-    while read -r mod; do
-        check_module_containers "$mod"
-        report_module_traefik_host "$mod"
-    done <<< "$MODULES"
-else
-    info "No modules to check"
-fi
-
-# ---------------------------------------------------------------------------
-# 4. Failed systemd services
-# ---------------------------------------------------------------------------
-header "Check: Failed systemd services"
-
-# System-wide
-failed_system=$(systemctl --failed --no-legend --no-pager 2>/dev/null || true)
-if [[ -n "$failed_system" ]]; then
-    problem "Failed system services:"
-    while read -r line; do
-        echo "  ${line}"
-    done <<< "$failed_system"
-else
-    ok "No failed system services"
-fi
-
-# Per-module services use the manager appropriate to the execution UID.
-if [[ -n "$MODULES" ]]; then
-    while IFS= read -r mod; do
-        check_module_services "$mod"
-    done <<< "$MODULES"
-fi
-
-# ---------------------------------------------------------------------------
-# 4b. Configured service port ownership
-# ---------------------------------------------------------------------------
-header "Check: Configured service port ownership"
-
-if [[ -n "$MODULES" ]]; then
-    while read -r mod; do
-        audit_whitelist_ports_for_module "$mod"
-    done <<< "$MODULES"
-else
-    info "No modules to check"
-fi
-
-# ---------------------------------------------------------------------------
-# 5. NethVoice-specific checks
-# ---------------------------------------------------------------------------
-header "Check: NethVoice modules"
-
-LOCAL_VPN_ADDRESS=$(ip -o -4 addr show dev wg0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true)
-collect_nethvoice_proxy_domain_uris
-proxy_modules=$(echo "$MODULES_ON_NODE" | awk -F'|' '$4 == "nethvoice-proxy" {print $1}' || true)
-
-if [[ -n "$proxy_modules" ]]; then
-    while read -r proxy_mod; do
-        [[ -z "$proxy_mod" ]] && continue
-        check_nethvoice_proxy_certificates "$proxy_mod"
-    done <<< "$proxy_modules"
-else
-    info "No nethvoice-proxy modules found for KML_DEFAULT_FQDN certificate checks"
-fi
-
-# Match only "nethvoice" modules, not "nethvoice-proxy" or other nethvoice-* variants
-nethvoice_modules=$(echo "$MODULES_ON_NODE" | awk -F'|' '$4 == "nethvoice" {print $1}' || true)
-if [[ -n "$nethvoice_modules" ]]; then
-    while read -r nv_mod; do
-        info "Checking NethVoice module: ${nv_mod}"
-
-        # --- DNS resolution inside freepbx container ---
-        dns_start=$(date +%s%N)
-        dns_out=$(runagent -m "$nv_mod" podman exec freepbx getent hosts ibm.com 2>&1 || true)
-        dns_end=$(date +%s%N)
-        dns_ms=$(( (dns_end - dns_start) / 1000000 ))
-
-        if [[ -z "$dns_out" || "$dns_ms" -gt $DNS_SLOW_MS ]]; then
-            problem "${nv_mod}: DNS resolution failed or too slow (${dns_ms}ms, getent hosts ibm.com)"
-            info "${nv_mod}: /etc/resolv.conf inside container freepbx:"
-            runagent -m "$nv_mod" podman exec freepbx cat /etc/resolv.conf 2>/dev/null | while read -r line; do
-                echo "  ${line}"
-            done
-        else
-            ok "${nv_mod}: DNS OK (ibm.com resolved in ${dns_ms}ms)"
-        fi
-
-        # --- mysqlcheck ---
-        # Run mysqlcheck inside the mariadb container; root password is in $MARIADB_ROOT_PASSWORD
-        # Database credentials expand only inside the container.
-        # shellcheck disable=SC2016
-        mysql_out=$(runagent -m "$nv_mod" podman exec mariadb \
-            sh -c 'mysqlcheck -uroot -p${MARIADB_ROOT_PASSWORD} -A' 2>&1 || true)
-
-        if echo "$mysql_out" | grep -qiE 'error|corrupt|crashed'; then
-            problem "${nv_mod}: mysqlcheck reported errors:"
-            echo "$mysql_out" | grep -iE 'error|corrupt|crashed' | while read -r line; do
-                echo "  ${line}"
-            done
-        elif [[ -z "$mysql_out" ]]; then
-            warning "${nv_mod}: mysqlcheck returned no output (mariadb container may not exist)"
-        else
-            ok "${nv_mod}: mysqlcheck OK"
-        fi
-
-        # --- localnets in asterisk.kvstore_Sipsettings ---
-        check_nethvoice_localnets "$nv_mod"
-
-        # --- FreePBX email from address ---
-        check_nethvoice_email_from_address "$nv_mod"
-
-        # --- Asterisk full log common errors ---
-        check_nethvoice_asterisk_full_logs "$nv_mod"
-
-        # --- nethvoice-proxy domain URI alignment ---
-        check_nethvoice_proxy_domain_uri "$nv_mod"
-
-        # --- public certificate checks ---
-        check_nethvoice_certificate "$nv_mod"
-
-        # --- Asterisk PJSIP contacts ---
-        check_nethvoice_asterisk_runtime "$nv_mod"
-        check_nethvoice_pjsip_contacts "$nv_mod"
-
-        # --- Asterisk AstDB AMPUSER cidname ---
-        check_nethvoice_astdb_cidname "$nv_mod"
-
-        # --- Asterisk AstDB call forward (CF) ---
-        cf_out=$(runagent -m "$nv_mod" podman exec freepbx asterisk -rx 'database show CF' 2>/dev/null || true)
-        if [[ -n "$cf_out" ]]; then
-            # Parse AstDB output lines like:
-            #   /CF/200                                       : 210
-            # and keep a unique extension|destination mapping for later checks.
-            cf_mappings=$(echo "$cf_out" | awk '
-                /^[[:space:]]*\/CF\// {
-                    line = $0
-                    sub(/^[[:space:]]*\/CF\//, "", line)
-                    split(line, parts, /[[:space:]]*:[[:space:]]*/)
-                    ext = parts[1]
-                    dest = parts[2]
-                    sub(/[[:space:]].*$/, "", ext)
-                    sub(/^[[:space:]]+/, "", dest)
-                    sub(/[[:space:]]+$/, "", dest)
-                    if (ext != "") {
-                        print ext "|" dest
-                    }
-                }
-            ' | sort -u)
-
-            if [[ -n "$cf_mappings" ]]; then
-                declare -A cf_targets=()
-                declare -A reported_cf_cycles=()
-
-                while IFS='|' read -r cf_ext cf_dest; do
-                    [[ -z "$cf_ext" ]] && continue
-                    # Keep only a numeric extension target so we can walk CF chains.
-                    # If the destination is external or non-numeric, the extension still
-                    # gets a warning but it is not considered for circular-chain checks.
-                    cf_target=""
-                    if [[ "$cf_dest" =~ ^[0-9]+$ ]]; then
-                        cf_target="$cf_dest"
-                    elif [[ "$cf_dest" =~ (^|[^0-9])([0-9]{2,})([^0-9]|$) ]]; then
-                        cf_target="${BASH_REMATCH[2]}"
-                    fi
-
-                    cf_targets["$cf_ext"]="$cf_target"
-                    warning "${nv_mod}: Extension ${cf_ext} has call forward enabled"
-                done <<< "$cf_mappings"
-
-                # Follow each extension CF chain until it ends or loops back to a
-                # previously visited extension. A repeated node means a circular CF.
-                for start_ext in "${!cf_targets[@]}"; do
-                    declare -A visited_cf=()
-                    cf_path=()
-                    current_ext="$start_ext"
-
-                    while [[ -n "$current_ext" && -n "${cf_targets[$current_ext]+x}" ]]; do
-                        if [[ -n "${visited_cf[$current_ext]+x}" ]]; then
-                            cycle_start_index=${visited_cf[$current_ext]}
-                            cycle_exts=( "${cf_path[@]:$cycle_start_index}" )
-                            cycle_desc=""
-                            for cycle_ext in "${cycle_exts[@]}"; do
-                                if [[ -n "$cycle_desc" ]]; then
-                                    cycle_desc+=" -> "
-                                fi
-                                cycle_desc+="$cycle_ext"
-                            done
-                            cycle_desc+=" -> ${current_ext}"
-
-                            for cycle_ext in "${cycle_exts[@]}"; do
-                                if [[ -z "${reported_cf_cycles[$cycle_ext]+x}" ]]; then
-                                    problem "${nv_mod}: Extension ${cycle_ext} has circular call forward configuration (${cycle_desc})"
-                                    reported_cf_cycles["$cycle_ext"]=1
-                                fi
-                            done
-                            break
-                        fi
-
-                        visited_cf["$current_ext"]=${#cf_path[@]}
-                        cf_path+=("$current_ext")
-                        next_ext="${cf_targets[$current_ext]}"
-                        if [[ -z "$next_ext" ]]; then
-                            break
-                        fi
-                        current_ext="$next_ext"
-                    done
-                done
-            else
-                ok "${nv_mod}: no extensions with call forward enabled (AstDB CF)"
-            fi
-        else
-            info "${nv_mod}: could not retrieve AstDB CF entries"
-        fi
-
-        # --- Asterisk queue ring strategy ---
-        queue_out=$(runagent -m "$nv_mod" podman exec freepbx asterisk -rx 'queue show' 2>/dev/null || true)
-        if [[ -n "$queue_out" ]]; then
-            # Parse `queue show` output queue-by-queue and count members only for
-            # queues whose strategy is explicitly set to `ringall`.
-            ringall_queue_agents=$(echo "$queue_out" | awk -v sq="'" '
-                BEGIN {
-                    queue = ""
-                    is_ringall = 0
-                    in_members = 0
-                    agents = 0
-                }
-
-                function flush_queue() {
-                    if (is_ringall && queue != "") {
-                        print queue "|" agents
-                    }
-                }
-
-                /^[^[:space:]].* has .* strategy/ {
-                    flush_queue()
-                    queue = ""
-                    is_ringall = 0
-                    in_members = 0
-                    agents = 0
-
-                    if (match($0, /^(.+) has .* in /, m)) {
-                        queue = m[1]
-                    }
-                    if (index($0, " in " sq "ringall" sq " strategy") > 0) {
-                        is_ringall = 1
-                    }
-                    next
-                }
-
-                is_ringall && /^[[:space:]]+Members:[[:space:]]*$/ {
-                    in_members = 1
-                    next
-                }
-
-                is_ringall && /^[[:space:]]+Callers:[[:space:]]*$/ {
-                    in_members = 0
-                    next
-                }
-
-                is_ringall && in_members {
-                    if ($0 ~ /^[[:space:]]+[^[:space:]]+/ && $0 !~ /^[[:space:]]+No Members/) {
-                        agents++
-                    }
-                    next
-                }
-
-                END {
-                    flush_queue()
-                }
-            ')
-
-            ringall_queue_count=$(echo "$ringall_queue_agents" | sed '/^$/d' | wc -l)
-            max_ringall_agents=0
-            max_ringall_queue=""
-            ringall_over_limit=""
-
-            if [[ -n "$ringall_queue_agents" ]]; then
-                # Evaluate both warning conditions:
-                # 1. too many queues using ringall
-                # 2. any ringall queue with too many agents
-                while IFS='|' read -r queue_name queue_agents; do
-                    [[ -z "$queue_name" ]] && continue
-                    [[ -z "$queue_agents" || ! "$queue_agents" =~ ^[0-9]+$ ]] && queue_agents=0
-
-                    if (( queue_agents > max_ringall_agents )); then
-                        max_ringall_agents=$queue_agents
-                        max_ringall_queue=$queue_name
-                    fi
-
-                    if (( queue_agents > QUEUE_RINGALL_MAX_AGENTS )); then
-                        ringall_over_limit+="${queue_name}(${queue_agents}) "
-                    fi
-                done <<< "$ringall_queue_agents"
-            fi
-
-            if (( ringall_queue_count > QUEUE_RINGALL_MAX_QUEUES )) || [[ -n "$ringall_over_limit" ]]; then
-                warning "${nv_mod}: Asterisk ringall strategy may overload endpoints (ringall queues: ${ringall_queue_count}, threshold: ${QUEUE_RINGALL_MAX_QUEUES}; queues with >${QUEUE_RINGALL_MAX_AGENTS} agents: ${ringall_over_limit:-none})"
-            elif (( ringall_queue_count > 0 )); then
-                info "${nv_mod}: ringall queues: ${ringall_queue_count} (max agents in a ringall queue: ${max_ringall_agents}${max_ringall_queue:+ in ${max_ringall_queue}})"
-            else
-                ok "${nv_mod}: no queues using ringall strategy"
-            fi
-        else
-            info "${nv_mod}: could not retrieve queue strategy data (Asterisk queue show unavailable)"
-        fi
-
-        # --- Asterisk environment port alignment ---
-        check_nethvoice_asterisk_port_alignment "$nv_mod"
-    done <<< "$nethvoice_modules"
-else
-    info "No NethVoice modules found"
-fi
-
-# ---------------------------------------------------------------------------
-# 6. Listening Ports / Sockets
-# ---------------------------------------------------------------------------
-header "Check: Listening ports for installed services"
-
-# Traefik (always expected on NS8)
-traefik_modules=$(echo "$MODULES" | grep -i "^traefik" || true)
-if [[ -n "$traefik_modules" ]]; then
-    check_port "Traefik HTTP" 80
-    check_port "Traefik HTTPS" 443
-fi
-
-# NethVoice SIP ports
-if [[ -n "$nethvoice_modules" ]]; then
-    while read -r nv_mod; do
-        check_nethvoice_listening_ports "$nv_mod"
-        check_hairpin_nat_for_nethvoice "$nv_mod"
-    done <<< "$nethvoice_modules"
-fi
-
-# Samba / NethService AD
-samba_modules=$(echo "$MODULES" | grep -i "^samba" || true)
-if [[ -n "$samba_modules" ]]; then
-    check_port "Samba LDAP" 389
-    check_port "Samba LDAPS" 636
-fi
-
-# Mail
-mail_modules=$(echo "$MODULES" | grep -i "^mail" || true)
-if [[ -n "$mail_modules" ]]; then
-    check_port "Mail SMTP" 25
-    check_port "Mail IMAP" 143
-    check_port "Mail IMAPS" 993
-fi
-
-if [[ -z "$traefik_modules" && -z "$nethvoice_modules" && -z "$samba_modules" && -z "$mail_modules" ]]; then
-    info "No well-known services to check ports for"
-fi
-
-# ---------------------------------------------------------------------------
-# 7. CrowdSec – check if local IPs are blocked
-# ---------------------------------------------------------------------------
-header "Check: CrowdSec IP blocking"
-
-crowdsec_modules=$(echo "$MODULES" | grep -i "^crowdsec" || true)
-if [[ -n "$crowdsec_modules" ]]; then
-    cs_mod=$(echo "$crowdsec_modules" | head -1)
-    warning "CrowdSec module found: ${cs_mod} (may cause connectivity issues)"
-
-    # Find the CrowdSec container
-    cs_container=$(runagent -m "$cs_mod" podman ps --format '{{.Names}}' 2>/dev/null \
-        | grep -i crowdsec | head -1 || true)
-
-    if [[ -z "$cs_container" ]]; then
-        warning "CrowdSec container not found in module ${cs_mod}"
+section_connectivity() {
+    header "Pre-check: Internet connectivity"
+    if (( OFFLINE )); then
+        info "Internet checks skipped (--offline)"
+        INTERNET_OK=0
+    elif ping -qc 1 -W 3 sos.nethesis.it &>/dev/null; then
+        ok "Internet connectivity OK (sos.nethesis.it reachable)"
     else
-        # Collect all local IPs (skip loopback)
-        local_ips=$(ip -o addr show 2>/dev/null \
-            | awk '{print $4}' | cut -d/ -f1 \
-            | grep -v '^127\.' | grep -v '^::1$' | sort -u)
+        warning "No internet connectivity (sos.nethesis.it unreachable) — GitHub version checks will be skipped"
+        INTERNET_OK=0
+    fi
+}
 
-        blocked_found=0
-        if [[ -n "$local_ips" ]]; then
-            while read -r ip; do
-                result=$(runagent -m "$cs_mod" podman exec "$cs_container" \
-                    cscli decisions list -i "$ip" -o raw 2>/dev/null | tail -n +2 || true)
-                if [[ -n "$result" ]]; then
-                    problem "CrowdSec: local IP ${ip} is BLOCKED"
-                    echo "  ${result}"
-                    blocked_found=1
-                fi
-            done <<< "$local_ips"
+section_general_system_data() {
+    local nameservers filenr used max rootfs cpu_cores load_avg_1 tz cluster_uuid
+    header "General System Data"
 
-            if [[ "$blocked_found" -eq 0 ]]; then
-                ok "CrowdSec: no local IPs are blocked (checked $(echo "$local_ips" | wc -l) addresses)"
-            fi
-        else
-            warning "Could not determine local IP addresses"
+    info_always "IP addresses: ${LOCAL_IPS_DISPLAY}"
+    if (( OFFLINE )); then
+        info_always "Public IP: lookup skipped (--offline)"
+    else
+        info_always "Public IP: ${PUBLIC_IP:-unavailable}"
+        [[ -z "$PUBLIC_IP" ]] && warning "Public IP could not be determined; hairpin NAT checks will be skipped"
+    fi
+
+    nameservers=$(grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | xargs || true)
+    info_always "DNS nameservers: ${nameservers:-N/A}"
+    info_always "Hostname: $(hostname -f 2>/dev/null || hostname 2>/dev/null || echo 'N/A')"
+
+    filenr=$(cat /proc/sys/fs/file-nr 2>/dev/null || true)
+    if [[ -n "$filenr" ]]; then
+        used=$(echo "$filenr" | awk '{print $1}')
+        max=$(echo "$filenr" | awk '{print $3}')
+        info_always "Open file descriptors: ${used} / ${max}"
+        if [[ "$max" -gt 0 ]] && (( used * 100 / max >= 90 )); then
+            problem "Open file descriptors at ${used}/${max} (>= 90%)"
         fi
     fi
-else
-    info "No CrowdSec module found, skipping"
-fi
 
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
-echo ""
-echo -e "${BOLD}=========================================${NC}"
-echo -e "${BOLD}Summary (Node ${NODE_ID})${NC}"
-echo -e "  Problems: ${RED}${PROBLEMS}${NC}"
-echo -e "  Warnings: ${YELLOW}${WARNINGS}${NC}"
-echo -e "${BOLD}=========================================${NC}"
+    rootfs=$(df -h / 2>/dev/null | awk 'NR==2{printf "%s used / %s total (%s full)", $3, $2, $5}')
+    info_always "Root filesystem: ${rootfs:-N/A}"
+    check_filesystem_usage "Root filesystem" /
+    check_readonly_mounts
 
-if [[ ${#PROBLEM_MSGS[@]} -gt 0 ]]; then
-    echo ""
-    echo -e "${RED}${BOLD}Problems:${NC}"
-    for msg in "${PROBLEM_MSGS[@]}"; do
-        echo -e "  ${RED}[PROBLEM]${NC} ${msg}"
+    cpu_cores=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || true)
+    load_avg_1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || true)
+    if [[ -n "$cpu_cores" && -n "$load_avg_1" ]]; then
+        info_always "CPU load average (1m): ${load_avg_1} on ${cpu_cores} core(s)"
+        if awk -v load_avg="$load_avg_1" -v cores="$cpu_cores" 'BEGIN { exit !(load_avg > (2 * cores)) }'; then
+            problem "CPU load average is ${load_avg_1} on ${cpu_cores} core(s) (> 2x core count)"
+        elif awk -v load_avg="$load_avg_1" -v cores="$cpu_cores" 'BEGIN { exit !(load_avg > cores) }'; then
+            warning "CPU load average is ${load_avg_1} on ${cpu_cores} core(s) (> core count)"
+        fi
+    fi
+
+    # Memory and swap pressure (uses available memory, including reclaimable cache)
+    check_node_memory /proc/meminfo
+
+    info_always "Uptime: $(uptime -p 2>/dev/null || uptime | sed 's/.*up/up/' || echo 'N/A')"
+    tz=$(timedatectl 2>/dev/null | grep -i 'time zone' | awk '{print $3, $4, $5}' || true)
+    info_always "Timezone: ${tz:-N/A}"
+    check_time_sync
+    check_reboot_required
+    check_selinux_denials
+
+    { IFS= read -r SUBSCRIPTION_SYSTEM_ID; IFS= read -r cluster_uuid; } < <(
+        printf 'HGET cluster/subscription system_id\nGET cluster/uuid\n' | redis_batch)
+    if [[ -z "$SUBSCRIPTION_SYSTEM_ID" ]]; then
+        warning "Cluster subscription system_id is empty or missing"
+    else
+        info_always "Subscription system_id: ${SUBSCRIPTION_SYSTEM_ID}"
+    fi
+    info_always "Cluster UUID: ${cluster_uuid:-N/A}"
+}
+
+section_logs() {
+    header "Check: /var/log/messages and journal errors"
+    check_log_file_size /var/log/messages
+    check_system_messages_log /var/log/messages
+    check_journal_errors
+}
+
+section_modules() {
+    local mod_id mod_source mod_version mod_name proxy_mod proxy_public
+    header "Check: List all modules on this node"
+    discover_node_and_modules
+    if [[ -z "$MODULES" ]]; then
+        warning "No modules found on node ${NODE_ID}"
+    else
+        info "Modules on node ${NODE_ID}:"
+        while IFS='|' read -r mod_id mod_source mod_version mod_name; do
+            info "  - ${mod_id} (${mod_name}) version ${mod_version}"
+        done <<< "$MODULES_ON_NODE"
+    fi
+
+    # Resolve every local module once (in parallel), then start the runtime
+    # queries; they complete while the cluster checks run.
+    prefetch_module_contexts
+    resolve_local_module_paths
+    prefetch_module_runtime
+    header "General System Data: Module home filesystems"
+    report_module_home_filesystems
+
+    # Without lookups, fall back to the address configured in the proxy.
+    if (( OFFLINE )) && [[ -z "$PUBLIC_IP" ]]; then
+        while read -r proxy_mod; do
+            [[ -z "$proxy_mod" ]] && continue
+            resolve_module_paths "$proxy_mod" || continue
+            proxy_public=$(get_env_var "${MODULE_ENV_FILES[$proxy_mod]}" PUBLIC_IP)
+            if [[ "$proxy_public" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                PUBLIC_IP="$proxy_public"
+                PUBLIC_IP_SOURCE="${proxy_mod} configuration"
+                info "Public IP from ${proxy_mod} configuration: ${PUBLIC_IP}"
+                break
+            fi
+        done <<< "$(get_modules_by_name nethvoice-proxy)"
+    fi
+}
+
+section_cluster() {
+    header "Check: Cluster, backups and updates"
+    check_wireguard_peers
+    if (( ! IS_LEADER )); then
+        check_redis_replication
+    fi
+    check_redis_persistence
+    check_backups
+    # shellcheck disable=SC2119
+    check_orphan_module_homes
+    check_software_repositories
+    check_ns8_updates
+    check_subscription_status
+    check_podman_storage
+}
+
+section_module_versions() {
+    local mod_id mod_source mod_version mod_name
+    header "Check: Module version vs latest GitHub release"
+    if [[ $INTERNET_OK -eq 0 ]]; then
+        warning "Skipping GitHub version checks (no internet connectivity)"
+        return 0
+    fi
+    if [[ -z "$MODULES_ON_NODE" ]]; then
+        info "No modules to check"
+        return 0
+    fi
+    while IFS='|' read -r mod_id mod_source mod_version mod_name; do
+        check_module_version_github "$mod_id" "$mod_source" "$mod_version" "$mod_name"
+    done <<< "$MODULES_ON_NODE"
+}
+
+section_module_runtime() {
+    local mod
+    header "Check: Container health per module"
+    if [[ -n "$MODULES" ]]; then
+        while read -r mod; do
+            check_module_containers "$mod"
+            report_module_traefik_host "$mod"
+        done <<< "$MODULES"
+    else
+        info "No modules to check"
+    fi
+
+    header "Check: Failed systemd services"
+    check_failed_system_services
+    # Per-module services use the manager appropriate to the execution UID.
+    if [[ -n "$MODULES" ]]; then
+        while IFS= read -r mod; do
+            check_module_services "$mod"
+        done <<< "$MODULES"
+    fi
+
+    header "Check: Configured service port ownership"
+    if [[ -n "$MODULES" ]]; then
+        while read -r mod; do
+            audit_whitelist_ports_for_module "$mod"
+        done <<< "$MODULES"
+    else
+        info "No modules to check"
+    fi
+}
+
+section_nethvoice() {
+    local proxy_modules nethvoice_modules proxy_mod nv_mod
+    header "Check: NethVoice modules"
+
+    LOCAL_VPN_ADDRESS=$(ip -o -4 addr show dev wg0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true)
+    collect_nethvoice_proxy_domain_uris
+    proxy_modules=$(get_modules_by_name nethvoice-proxy)
+    if [[ -n "$proxy_modules" ]]; then
+        while read -r proxy_mod; do
+            [[ -z "$proxy_mod" ]] && continue
+            check_nethvoice_proxy_certificates "$proxy_mod"
+            check_nethvoice_proxy_runtime "$proxy_mod"
+        done <<< "$proxy_modules"
+    else
+        info "No nethvoice-proxy modules found for KML_DEFAULT_FQDN certificate checks"
+    fi
+
+    # Match only "nethvoice" modules, not "nethvoice-proxy" or other nethvoice-* variants
+    nethvoice_modules=$(get_modules_by_name nethvoice)
+    if [[ -n "$nethvoice_modules" ]]; then
+        check_cluster_smarthost
+        while read -r nv_mod; do
+            check_nethvoice_module "$nv_mod"
+        done <<< "$nethvoice_modules"
+    else
+        info "No NethVoice modules found"
+    fi
+}
+
+section_listening_ports() {
+    local traefik_modules nethvoice_modules samba_modules mail_modules nv_mod
+    header "Check: Listening ports for installed services"
+
+    # Selected by image name, not module ID prefix.
+    traefik_modules=$(get_modules_by_name traefik)
+    if [[ -n "$traefik_modules" ]]; then
+        check_port "Traefik HTTP" 80
+        check_port "Traefik HTTPS" 443
+    fi
+
+    nethvoice_modules=$(get_modules_by_name nethvoice)
+    if [[ -n "$nethvoice_modules" ]]; then
+        while read -r nv_mod; do
+            check_nethvoice_listening_ports "$nv_mod"
+            check_hairpin_nat_for_nethvoice "$nv_mod"
+        done <<< "$nethvoice_modules"
+    fi
+
+    samba_modules=$(get_modules_by_name samba)
+    if [[ -n "$samba_modules" ]]; then
+        check_port "Samba LDAP" 389
+        check_port "Samba LDAPS" 636
+    fi
+
+    mail_modules=$(get_modules_by_name mail)
+    if [[ -n "$mail_modules" ]]; then
+        check_port "Mail SMTP" 25
+        check_port "Mail IMAP" 143
+        check_port "Mail IMAPS" 993
+    fi
+
+    if [[ -z "$traefik_modules" && -z "$nethvoice_modules" && -z "$samba_modules" && -z "$mail_modules" ]]; then
+        info "No well-known services to check ports for"
+    fi
+}
+
+# JSON string with quotes, backslashes and control characters escaped.
+json_string() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    s=$(printf '%s' "$s" | tr -d '\000-\010\013\014\016-\037')
+    printf '"%s"' "$s"
+}
+
+json_array() {
+    local item first=1
+    printf '['
+    for item in "$@"; do
+        (( first )) || printf ','
+        first=0
+        json_string "$item"
     done
-fi
+    printf ']'
+}
 
-if [[ ${#WARNING_MSGS[@]} -gt 0 ]]; then
+print_json_report() {
+    printf '{"tool":"sysanal3","date":%s,"hostname":%s,"node_id":%s,"cluster_role":%s,' \
+        "$(json_string "$(date -Iseconds)")" "$(json_string "$(hostname -f 2>/dev/null || hostname)")" \
+        "$(json_string "$NODE_ID")" "$(json_string "$CLUSTER_ROLE")"
+    printf '"problem_count":%d,"warning_count":%d,"problems":%s,"warnings":%s}\n' \
+        "$PROBLEMS" "$WARNINGS" "$(json_array "${PROBLEM_MSGS[@]}")" "$(json_array "${WARNING_MSGS[@]}")"
+}
+
+print_summary() {
+    local msg
     echo ""
-    echo -e "${YELLOW}${BOLD}Warnings:${NC}"
-    for msg in "${WARNING_MSGS[@]}"; do
-        echo -e "  ${YELLOW}[WARNING]${NC} ${msg}"
+    echo -e "${BOLD}=========================================${NC}"
+    echo -e "${BOLD}Summary (Node ${NODE_ID}, ${CLUSTER_ROLE})${NC}"
+    echo -e "  Problems: ${RED}${PROBLEMS}${NC}"
+    echo -e "  Warnings: ${YELLOW}${WARNINGS}${NC}"
+    echo -e "${BOLD}=========================================${NC}"
+
+    if [[ ${#PROBLEM_MSGS[@]} -gt 0 ]]; then
+        echo ""
+        echo -e "${RED}${BOLD}Problems:${NC}"
+        for msg in "${PROBLEM_MSGS[@]}"; do
+            echo -e "  ${RED}[PROBLEM]${NC} ${msg}"
+        done
+    fi
+
+    if [[ ${#WARNING_MSGS[@]} -gt 0 ]]; then
+        echo ""
+        echo -e "${YELLOW}${BOLD}Warnings:${NC}"
+        for msg in "${WARNING_MSGS[@]}"; do
+            echo -e "  ${YELLOW}[WARNING]${NC} ${msg}"
+        done
+    fi
+}
+
+usage() {
+    cat <<'EOF'
+Usage: sysanal3 [--silent] [--json] [--offline]
+
+  -s, --silent   Suppress OK and most INFO messages
+  --json         Print a JSON report on stdout; human-readable output goes to stderr
+  --offline      Skip external lookups and active probes (public IP services,
+                 GitHub, TLS handshakes, hairpin NAT, update and subscription queries)
+  --worker       Accepted for compatibility; the node role is detected automatically
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -s|--silent) SILENT=1 ;;
+            --json) JSON_OUTPUT=1 ;;
+            --offline) OFFLINE=1 ;;
+            --worker) ;;
+            -h|--help) usage; exit 0 ;;
+            *) ;;
+        esac
+        shift
     done
+}
+
+main() {
+    parse_args "$@"
+
+    if [[ $EUID -ne 0 ]]; then
+        echo "This script must be run as root" >&2
+        exit 1
+    fi
+
+    # Keep stdout for the JSON document; human-readable output goes to stderr.
+    if (( JSON_OUTPUT )); then
+        exec 3>&1 1>&2
+    fi
+
+    echo -e "${BOLD}sysanal3 - NethServer 8 System Analyzer V3${NC}"
+    echo "========================================="
+    echo "Date: $(date)"
+
+    start_background_jobs
+    init_network_identity
+
+    section_connectivity
+    section_general_system_data
+
+    header "Check: sngrep long-running instances"
+    check_sngrep_instances
+
+    section_logs
+    section_modules
+    section_cluster
+    section_module_versions
+    section_module_runtime
+    section_nethvoice
+    section_listening_ports
+
+    header "Check: CrowdSec IP blocking"
+    check_crowdsec
+
+    print_summary
+    if (( JSON_OUTPUT )); then
+        print_json_report >&3
+    fi
+
+    if [[ $PROBLEMS -gt 0 ]]; then
+        exit 1
+    fi
+    exit 0
+}
+
+# Sourcing defines helpers for local tests without executing the analyzer.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
 fi
 
-if [[ $PROBLEMS -gt 0 ]]; then
-    exit 1
-fi
-
-exit 0
+main "$@"
