@@ -528,6 +528,32 @@ touch "$fixture_root/udp-listener"
 check_port_owner 'split SIP UDP' 24005 '(^| )asterisk( |$)' asterisk udp >> "$fixture_root/output"
 assert_eq "$PROBLEMS" 1 'actual UDP listener passes'
 
+# pasta.* accepts the bare process name and suffixes, but requires its prefix.
+cat > "$fixture_root/bin/ss" <<'MOCK'
+#!/bin/bash
+process=$(cat "$DIAGNOSTIC_FIXTURES/listener-process")
+printf 'LISTEN 0 128 0.0.0.0:20107 0.0.0.0:* users:(("%s",pid=1,fd=1))\n' "$process"
+MOCK
+for var_name in REPORTS_REDIS_PORT POSTGRES_PORT REDIS_PORT; do
+    for process in pasta pasta.avx2 pasta-helper node notpasta; do
+        printf '%s\n' "$process" > "$fixture_root/listener-process"
+        reset_messages
+        if check_configured_service_port voice "$var_name" 20107 \
+            "$(get_whitelist_port_expected_regex "$var_name")" \
+            "$(get_whitelist_port_expected_service "$var_name")" >> "$fixture_root/output"; then
+            result=0
+        else
+            result=1
+        fi
+        case "$process" in
+            pasta*) expected=0 ;;
+            *) expected=1 ;;
+        esac
+        assert_eq "$result" "$expected" "$var_name owner check for $process"
+        assert_eq "$PROBLEMS" "$expected" "$var_name findings for $process"
+    done
+done
+
 if grep -Eq 'SECRET_CANARY|IDENTIFIER_CANARY|SIP_IDENTITY_CANARY|CUSTOMER_CANARY|PRIVATE_CANARY' "$fixture_root/output" "$fixture_root/memory-output"; then
     fail 'raw command metadata or contact identities disclosed'
 fi
