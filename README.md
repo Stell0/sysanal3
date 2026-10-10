@@ -62,6 +62,7 @@ It exits with code `1` if any problem is found, otherwise `0`.
   - PJSIP endpoint counts (configured/unavailable), outbound registrations not registered (problem), and channels older than 4 hours (warning), all reduced to counts inside the container.
   - nethvoice-proxy Kamailio dispatcher destinations (inactive or disabled is a problem), RTPengine availability, and proxy `PUBLIC_IP` versus the detected public IP.
   - AstDB `AMPUSER//cidname` check (warns if an empty-extension `cidname` entry exists and suggests `database del AMPUSER/ cidname` in the Asterisk CLI).
+  - AstDB write check: when `/var/lib/asterisk/db/astdb.sqlite3` has not changed for more than 20 minutes, writes a unique temporary key through Asterisk, reads it back, waits up to 5 seconds for the file timestamp to advance, then deletes the key and verifies removal. Write, persistence or cleanup failures are problems; unavailable checks warn. This local check also runs with `--offline`.
   - AstDB call forward check (warns for each extension with `CF` enabled and flags circular forwarding chains as problems).
   - Asterisk queue ring strategy check (warns if more than 3 queues use `ringall`, or any `ringall` queue has more than 5 agents).
   - Validates NethVoice `*PORT*` environment variables against listening processes (e.g. Asterisk/Kamailio ownership checks).
@@ -153,6 +154,7 @@ fi
 | `RUNAGENT_TIMEOUT` | `15` | Seconds allowed for each module-context `runagent` query. |
 | `FS_WARNING_PCT` / `FS_PROBLEM_PCT` | `85` / `95` | Filesystem block and inode usage thresholds. |
 | `NV_CHANNEL_MAX_AGE` | `14400` | Asterisk channel age (seconds) that warns. |
+| `NV_ASTDB_MAX_AGE` | `1200` | AstDB file age (seconds) above which a temporary write probe runs. |
 | `WG_HANDSHAKE_MAX_AGE` | `300` | WireGuard handshake age (seconds) that flags an unreachable node. |
 | `BACKUP_AGE_GRACE_SECONDS` | `3600` | Slack added to twice the backup interval before a run is overdue. |
 | `PODMAN_RECLAIMABLE_WARNING_BYTES` | `10000000000` | Unused rootful image size that warns. |

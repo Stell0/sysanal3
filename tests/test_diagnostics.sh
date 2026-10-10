@@ -1,7 +1,7 @@
 #!/bin/bash
 # The sourced analyzer returns before main; ShellCheck follows its direct-run exits.
 # shellcheck disable=SC2317,SC2329
-# Passive diagnostic regressions. No NS8 node or active network probes are needed.
+# Diagnostic regressions. All probes use fixtures; no NS8 node is needed.
 set -uo pipefail
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 fixture_root=$(mktemp -d)
@@ -66,6 +66,43 @@ MOCK
 cat > "$fixture_root/bin/asterisk" <<'MOCK'
 #!/bin/bash
 [[ $# == 2 && $1 == -rx ]] || exit 99
+if [[ "$2" == 'database '* ]]; then
+    printf '%s\n' "$2" >> "$DIAGNOSTIC_FIXTURES/astdb.commands"
+    read -ra args <<< "$2"
+    [[ ${args[2]:-} == SYSANAL3 && ${args[3]:-} == probe-* ]] || exit 99
+    mode=$(cat "$DIAGNOSTIC_FIXTURES/astdb.mode")
+    entry="$DIAGNOSTIC_FIXTURES/astdb.entry.${args[3]}"
+    case "${args[1]}" in
+        put)
+            if [[ $mode == write_error ]]; then echo 'Failed to update entry'; exit 0; fi
+            printf '%s\n' "${args[4]}" > "$entry"
+            [[ $mode != write_exit_error ]] || exit 1
+            [[ $mode != write_timeout ]] || /usr/bin/sleep 3
+            echo 'Updated database successfully'
+            ;;
+        get)
+            [[ $mode != cli_error ]] || { echo SECRET_CANARY; exit 1; }
+            if [[ $mode == collision ]]; then
+                echo 'Value: SECRET_CANARY'
+            elif [[ -f "$entry" ]]; then
+                if [[ $mode == read_error ]]; then echo 'Value: SECRET_CANARY'; else printf 'Value: %s\n' "$(cat "$entry")"; fi
+            else
+                echo 'Database entry not found.'
+            fi
+            ;;
+        del)
+            if [[ $mode == cleanup_error || ( $mode == cleanup_retry && ! -f "$DIAGNOSTIC_FIXTURES/astdb.retried" ) ]]; then
+                touch "$DIAGNOSTIC_FIXTURES/astdb.retried"
+                echo 'Database entry could not be removed.'
+            else
+                rm -f -- "$entry"
+                echo 'Database entry removed.'
+            fi
+            ;;
+        *) exit 99 ;;
+    esac
+    exit 0
+fi
 case "$2" in
     'core show version') stage=version ;;
     'core show uptime seconds') stage=uptime ;;
@@ -377,6 +414,81 @@ assert_contains "${PROBLEM_MSGS[0]}" '1 of 2 outbound SIP registration' 'registr
 assert_eq "$WARNINGS" 1 'channel older than the limit warns'
 assert_contains "${WARNING_MSGS[0]}" '1 of 2 active channel' 'long channel count reported'
 
+# AstDB age and writes use mocked filesystem metadata and CLI state. No real
+# database is touched, and a delayed flush is simulated without waiting.
+cat > "$fixture_root/bin/stat" <<'MOCK'
+#!/bin/bash
+if [[ "$*" == '-c %Y -- /var/lib/asterisk/db/astdb.sqlite3' ]]; then
+    cat "$DIAGNOSTIC_FIXTURES/astdb.mtime" 2>/dev/null
+else
+    exec /usr/bin/stat "$@"
+fi
+MOCK
+cat > "$fixture_root/bin/date" <<'MOCK'
+#!/bin/bash
+if [[ "$*" == +%s && -f "$DIAGNOSTIC_FIXTURES/astdb.now" ]]; then
+    cat "$DIAGNOSTIC_FIXTURES/astdb.now"
+else
+    exec /usr/bin/date "$@"
+fi
+MOCK
+cat > "$fixture_root/bin/sleep" <<'MOCK'
+#!/bin/bash
+if [[ "$*" == 1 && -f "$DIAGNOSTIC_FIXTURES/astdb.now" ]]; then
+    echo tick >> "$DIAGNOSTIC_FIXTURES/astdb.sleeps"
+    mode=$(cat "$DIAGNOSTIC_FIXTURES/astdb.mode")
+    if [[ $mode != no_flush && $mode != bad_stat ]]; then
+        cp "$DIAGNOSTIC_FIXTURES/astdb.now" "$DIAGNOSTIC_FIXTURES/astdb.mtime"
+    elif [[ $mode == bad_stat ]]; then
+        echo invalid > "$DIAGNOSTIC_FIXTURES/astdb.mtime"
+    fi
+else
+    exec /usr/bin/sleep "$@"
+fi
+MOCK
+chmod +x "$fixture_root/bin/"{stat,date,sleep}
+astdb_fixture() {
+    reset_messages
+    rm -f "$fixture_root/astdb."{entry.*,retried,sleeps}
+    : > "$fixture_root/astdb.commands"
+    printf '%s\n' "$1" > "$fixture_root/astdb.mode"
+    printf '10000\n' > "$fixture_root/astdb.now"
+    printf '%s\n' "$((10000 - ${2:-1201}))" > "$fixture_root/astdb.mtime"
+}
+for age in 1199 1200; do
+    astdb_fixture ok "$age"
+    check_nethvoice_astdb_writable rootless >> "$fixture_root/output"
+    assert_eq "$PROBLEMS:$WARNINGS" 0:0 'recent AstDB does not raise findings'
+    [[ ! -s "$fixture_root/astdb.commands" ]] || fail 'AstDB at or below 20 minutes must not run CLI commands'
+done
+for mode in ok cleanup_retry write_error write_exit_error write_timeout read_error no_flush bad_stat cleanup_error; do
+    astdb_fixture "$mode"
+    check_nethvoice_astdb_writable rootless >> "$fixture_root/output"
+    if [[ $mode == bad_stat ]]; then expected=1; else expected=0; fi
+    assert_eq "$WARNINGS" "$expected" "$mode probe completes with structured results"
+    if [[ $mode == ok || $mode == cleanup_retry || $mode == bad_stat ]]; then expected=0; else expected=1; fi
+    assert_eq "$PROBLEMS" "$expected" "$mode probe finding"
+    assert_contains "$(cat "$fixture_root/astdb.commands")" 'database put SYSANAL3 probe-' "$mode writes only a probe key"
+    assert_contains "$(cat "$fixture_root/astdb.commands")" 'database del SYSANAL3 probe-' "$mode attempts cleanup even after write failure"
+    if [[ $mode != cleanup_error ]]; then
+        compgen -G "$fixture_root/astdb.entry.*" >/dev/null && fail "$mode left a probe entry behind"
+    else
+        assert_contains "${PROBLEM_MSGS[0]}" 'cleanup failed' 'cleanup failure gives a problem and manual removal command'
+    fi
+    if [[ $mode == no_flush ]]; then
+        assert_eq "$(wc -l < "$fixture_root/astdb.sleeps")" 5 'flush wait is bounded'
+        assert_contains "${PROBLEM_MSGS[0]}" 'timestamp did not advance' 'CLI success without disk activity is a persistence finding'
+    fi
+done
+for mode in collision cli_error missing_stat; do
+    astdb_fixture "$mode"
+    [[ $mode != missing_stat ]] || rm "$fixture_root/astdb.mtime"
+    check_nethvoice_astdb_writable rootless >> "$fixture_root/output"
+    assert_eq "$PROBLEMS:$WARNINGS" 0:1 "$mode is an unavailable check, not a persistence finding"
+    if grep -Eq 'database (put|del)' "$fixture_root/astdb.commands"; then fail "$mode must not modify AstDB"; fi
+done
+rm -f "$fixture_root/astdb.now"
+
 # Restart reporting and failed system units.
 reset_messages
 printf 'cockpit.service loaded failed failed Cockpit\npromtail.service loaded failed failed Alloy\n' > "$fixture_root/failed-units"
@@ -557,4 +669,4 @@ done
 if grep -Eq 'SECRET_CANARY|IDENTIFIER_CANARY|SIP_IDENTITY_CANARY|CUSTOMER_CANARY|PRIVATE_CANARY' "$fixture_root/output" "$fixture_root/memory-output"; then
     fail 'raw command metadata or contact identities disclosed'
 fi
-printf 'PASS: service contexts, restart recency, container health, memory, Asterisk aggregates, cluster VPN, backups, leftovers, proxy, JSON\n'
+printf 'PASS: service contexts, restart recency, container health, memory, Asterisk aggregates, AstDB writes and cleanup, cluster VPN, backups, leftovers, proxy, JSON\n'

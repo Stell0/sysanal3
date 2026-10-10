@@ -58,6 +58,7 @@ It exits with code `1` if problems are found, otherwise `0`.
 	- **Asterisk PJSIP contacts**: Parse `Objects found` inside the container, without returning contact URIs. Warn if zero and the CLI is running.
 	- **PJSIP endpoints, registrations and channels**: Reduced to counts inside the container. Report configured/unavailable endpoints; outbound registrations in `Rejected`, `Unregistered` or `Stopped` state are a problem; channels older than `NV_CHANNEL_MAX_AGE` (`core show channels concise` duration) warn.
 	- **Asterisk AstDB AMPUSER cidname**: Warns if an entry with empty extension exists, such as `/AMPUSER//cidname`, and suggests running `database del AMPUSER/ cidname` in the Asterisk CLI.
+	- **Asterisk AstDB writes**: If `/var/lib/asterisk/db/astdb.sqlite3` is older than `NV_ASTDB_MAX_AGE` (20 minutes), use Asterisk CLI `database put/get/del` with a unique temporary `SYSANAL3` key. Verify readback, wait up to 5 seconds for the file timestamp to advance, and verify cleanup even after a failed write. Write, persistence and cleanup failures are problems; unavailable checks warn. Run synchronously outside the read-only snapshots, including with `--offline`.
 	- **Asterisk AstDB call forward (CF)**: Warns for each extension that has `CF` enabled and flags circular call forward chains as problems.
 	- **Asterisk queue ring strategy**: Warns if more than 3 queues use `ringall`, or if any `ringall` queue has more than 5 agents.
 	- Validate NethVoice `*PORT*` environment variables against listening processes (Asterisk/Kamailio ownership checks).
@@ -156,6 +157,7 @@ It exits with code `1` if problems are found, otherwise `0`.
 - `RUNAGENT_TIMEOUT=15` — Seconds for each module-context `runagent` query.
 - `FS_WARNING_PCT=85` / `FS_PROBLEM_PCT=95` — Filesystem block and inode usage thresholds (root and module-home filesystems).
 - `NV_CHANNEL_MAX_AGE=14400` — Asterisk channel age (seconds) that warns.
+- `NV_ASTDB_MAX_AGE=1200` — AstDB file age (seconds) above which a temporary write probe runs.
 - `WG_HANDSHAKE_MAX_AGE=300` — WireGuard handshake age (seconds) that flags an unreachable node.
 - `BACKUP_AGE_GRACE_SECONDS=3600` — Slack added to twice the backup interval.
 - `PODMAN_RECLAIMABLE_WARNING_BYTES=10000000000` — Reclaimable rootful image size that warns.

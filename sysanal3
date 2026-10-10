@@ -1593,6 +1593,92 @@ check_nethvoice_astdb_cidname() {
     fi
 }
 
+# This probe deliberately writes through Asterisk; keep it out of the read-only
+# background snapshots. Only our unique key is ever deleted, never a key tree.
+ASTDB_WRITE_CHECK_SCRIPT=$(cat <<'EOF'
+max_age=$1
+key=$2
+db=/var/lib/asterisk/db/astdb.sqlite3
+rx() { timeout 2s asterisk -rx "$1"; }
+mtime=$(stat -c %Y -- "$db") || exit 1
+now=$(date +%s) || exit 1
+case "$mtime:$now" in *[!0-9:]*|:*|*:) exit 1 ;; esac
+age=$((now - mtime))
+if [ "$age" -le "$max_age" ]; then
+    printf 'recent\n'
+    exit 0
+fi
+# A collision or unavailable CLI must never overwrite an existing value.
+out=$(rx "database get SYSANAL3 $key") || exit 1
+[ "$out" = 'Database entry not found.' ] || exit 1
+cleanup_needed=1
+cleanup() {
+    [ "$cleanup_needed" = 1 ] || return 0
+    # Also attempt deletion after a failed/timed-out put: it may have written.
+    for _attempt in 1 2; do
+        rx "database del SYSANAL3 $key" >/dev/null 2>&1
+        out=$(rx "database get SYSANAL3 $key") &&
+            [ "$out" = 'Database entry not found.' ] && {
+                cleanup_needed=0
+                return 0
+            }
+    done
+    return 1
+}
+trap 'cleanup >/dev/null 2>&1' EXIT
+trap 'exit 1' HUP INT TERM
+result=write_failed
+# CLI exit status alone does not indicate whether the database operation worked.
+if out=$(rx "database put SYSANAL3 $key $key") && [ "$out" = 'Updated database successfully' ]; then
+    result=read_failed
+    if out=$(rx "database get SYSANAL3 $key") && [ "$out" = "Value: $key" ]; then
+        result=flush_failed
+        # AstDB commits asynchronously. Check disk activity before removing the
+        # entry, allowing up to five seconds for Asterisk's sync thread.
+        for _attempt in 1 2 3 4 5; do
+            sleep 1
+            updated=$(stat -c %Y -- "$db") || { result=stat_failed; break; }
+            case "$updated" in ''|*[!0-9]*) result=stat_failed; break ;; esac
+            if [ "$updated" -gt "$mtime" ]; then result=ok; break; fi
+        done
+    fi
+fi
+cleanup_ok=0
+if cleanup; then cleanup_ok=1; fi
+trap - EXIT HUP INT TERM
+printf 'tested %s %s\n' "$result" "$cleanup_ok"
+EOF
+)
+
+check_nethvoice_astdb_writable() {
+    local nv_mod="$1" key output state result cleanup_ok extra
+    key="probe-$$-$(new_snapshot_marker)"
+    if ! output=$(timeout 30s runagent -m "$nv_mod" podman exec freepbx sh -c "$ASTDB_WRITE_CHECK_SCRIPT" \
+        sh "$NV_ASTDB_MAX_AGE" "$key" </dev/null 2>/dev/null); then
+        warning "${nv_mod}: could not check AstDB file age or complete the write probe (check Asterisk and /var/lib/asterisk/db/astdb.sqlite3)"
+        return
+    fi
+    read -r state result cleanup_ok extra <<< "$output"
+    if [[ "$output" == recent ]]; then
+        ok "${nv_mod}: AstDB was modified within the last $(format_duration "$NV_ASTDB_MAX_AGE"); write probe skipped"
+    elif [[ "$state" == tested && "$result" =~ ^(ok|write_failed|read_failed|flush_failed|stat_failed)$ &&
+        "$cleanup_ok" =~ ^[01]$ && -z "$extra" && "$output" != *$'\n'* ]]; then
+        case "$result" in
+            write_failed) problem "${nv_mod}: AstDB write probe failed (Asterisk database put)" ;;
+            read_failed) problem "${nv_mod}: AstDB write probe could not read back the test value" ;;
+            flush_failed) problem "${nv_mod}: AstDB file timestamp did not advance after the write probe (possible persistence failure)" ;;
+            stat_failed) warning "${nv_mod}: could not verify AstDB file timestamp after the write probe" ;;
+        esac
+        if [[ "$cleanup_ok" == 0 ]]; then
+            problem "${nv_mod}: AstDB test entry cleanup failed; run \`database del SYSANAL3 ${key}\` in the Asterisk CLI"
+        elif [[ "$result" == ok ]]; then
+            ok "${nv_mod}: AstDB write probe succeeded and test entry was removed"
+        fi
+    else
+        warning "${nv_mod}: invalid AstDB write-probe result"
+    fi
+}
+
 check_nethvoice_email_from_address() {
     local nv_mod="$1" smtp_from voicemail_mailcmd
 
@@ -1875,6 +1961,7 @@ DNS_SLOW_MS=2000               # DNS resolution slower than this (ms) flags a pr
 QUEUE_RINGALL_MAX_QUEUES=3     # Warn if ringall strategy is used by more than this number of queues
 QUEUE_RINGALL_MAX_AGENTS=5     # Warn if any ringall queue has more than this number of agents
 NV_CHANNEL_MAX_AGE=14400       # Asterisk channels older than this (seconds) may be stuck calls
+NV_ASTDB_MAX_AGE=1200          # Probe AstDB writes only after 20 minutes without file changes
 WG_HANDSHAKE_MAX_AGE=300       # WireGuard peers without a handshake for this long are unreachable
 BACKUP_AGE_GRACE_SECONDS=3600  # Slack added to twice the backup interval before a run is overdue
 PODMAN_RECLAIMABLE_WARNING_BYTES=10000000000  # Warn when unused rootful images exceed 10 GB
@@ -2903,6 +2990,7 @@ check_nethvoice_module() {
     check_nethvoice_pjsip_endpoints "$nv_mod"
     check_nethvoice_trunk_registrations "$nv_mod"
     check_nethvoice_long_channels "$nv_mod"
+    check_nethvoice_astdb_writable "$nv_mod"
     check_nethvoice_astdb_cidname "$nv_mod"
     check_nethvoice_call_forwards "$nv_mod"
     check_nethvoice_queue_strategy "$nv_mod"
