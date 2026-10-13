@@ -332,6 +332,58 @@ printf '' > "$fixture_root/empty.ids"
 check_module_containers empty >> "$fixture_root/output"
 assert_eq "$WARNINGS" 2 'modules without containers are allowed'
 
+ipv6_conf="$fixture_root/ipv6 conf"
+mkdir -p "$ipv6_conf"/{all,default,lo,eth0,eth0.100,veth0}
+for interface in all default lo eth0 eth0.100 veth0; do
+    printf '1\n' > "$ipv6_conf/$interface/disable_ipv6"
+done
+reset_messages
+SILENT=0
+printf '0\n' > "$ipv6_conf/all/disable_ipv6"
+printf '0\n' > "$ipv6_conf/default/disable_ipv6"
+check_interface_ipv6 "$ipv6_conf" > "$fixture_root/ipv6-output"
+assert_eq "$PROBLEMS" 0 'all/default are not interfaces'
+assert_eq "$WARNINGS" 0 'disabled interfaces do not warn'
+assert_contains "$(cat "$fixture_root/ipv6-output")" '[OK]' 'all disabled interfaces report OK'
+printf '1\n' > "$ipv6_conf/all/disable_ipv6"
+printf '1\n' > "$ipv6_conf/default/disable_ipv6"
+printf '0\n' > "$ipv6_conf/eth0/disable_ipv6"
+SILENT=1
+OFFLINE=1
+check_interface_ipv6 "$ipv6_conf" > "$fixture_root/ipv6-output"
+assert_eq "$PROBLEMS" 1 'one enabled interface is a problem even when all/default are disabled'
+assert_contains "$(cat "$fixture_root/ipv6-output")" '[ERROR]' 'IPv6 error is visible in silent/offline mode'
+assert_contains "${PROBLEM_MSGS[0]}" 'eth0' 'enabled interface named'
+assert_contains "$(print_json_report)" 'IPv6 is enabled on network interface(s): eth0' 'IPv6 is included in JSON problems'
+reset_messages
+printf '1\n' > "$ipv6_conf/eth0/disable_ipv6"
+printf '0\n' > "$ipv6_conf/lo/disable_ipv6"
+check_interface_ipv6 "$ipv6_conf" >> "$fixture_root/ipv6-output"
+assert_eq "$PROBLEMS" 1 'loopback alone with IPv6 enabled is a problem'
+reset_messages
+printf '0\n' > "$ipv6_conf/eth0.100/disable_ipv6"
+printf '0\n' > "$ipv6_conf/veth0/disable_ipv6"
+check_interface_ipv6 "$ipv6_conf" >> "$fixture_root/ipv6-output"
+assert_eq "$PROBLEMS" 1 'multiple enabled interfaces produce one finding'
+assert_contains "${PROBLEM_MSGS[0]}" 'eth0.100 lo veth0' 'VLAN, loopback and virtual interfaces named'
+reset_messages
+printf '1\n' > "$ipv6_conf/lo/disable_ipv6"
+printf '1\n' > "$ipv6_conf/veth0/disable_ipv6"
+printf 'invalid\n' > "$ipv6_conf/eth0.100/disable_ipv6"
+rm "$ipv6_conf/eth0/disable_ipv6"
+check_interface_ipv6 "$ipv6_conf" >> "$fixture_root/ipv6-output" 2> "$fixture_root/ipv6-stderr"
+assert_eq "$PROBLEMS" 0 'unavailable IPv6 state is not a false enabled finding'
+assert_eq "$WARNINGS" 2 'missing and invalid interface state warn'
+assert_eq "$(cat "$fixture_root/ipv6-stderr")" '' 'missing interface files do not expose raw errors'
+reset_messages
+check_interface_ipv6 "$fixture_root/absent-ipv6" >> "$fixture_root/ipv6-output"
+assert_eq "$PROBLEMS" 0 'kernel without IPv6 has no IPv6 finding'
+assert_eq "$WARNINGS" 0 'absent kernel IPv6 sysctls are allowed'
+mkdir "$fixture_root/empty-ipv6"
+check_interface_ipv6 "$fixture_root/empty-ipv6" >> "$fixture_root/ipv6-output"
+assert_eq "$WARNINGS" 1 'existing sysctl directory without interface measurements warns'
+OFFLINE=0
+
 memory_fixture() {
     printf 'MemTotal: 1000 kB\nMemAvailable: %s kB\nSwapTotal: 100 kB\nSwapFree: 75 kB\n' "$1" > "$fixture_root/meminfo"
 }
@@ -669,4 +721,4 @@ done
 if grep -Eq 'SECRET_CANARY|IDENTIFIER_CANARY|SIP_IDENTITY_CANARY|CUSTOMER_CANARY|PRIVATE_CANARY' "$fixture_root/output" "$fixture_root/memory-output"; then
     fail 'raw command metadata or contact identities disclosed'
 fi
-printf 'PASS: service contexts, restart recency, container health, memory, Asterisk aggregates, AstDB writes and cleanup, cluster VPN, backups, leftovers, proxy, JSON\n'
+printf 'PASS: service contexts, restart recency, container health, interface IPv6, memory, Asterisk aggregates, AstDB writes and cleanup, cluster VPN, backups, leftovers, proxy, JSON\n'

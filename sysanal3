@@ -75,6 +75,7 @@ EOF
 )
 
 problem() { echo -e "${RED}[PROBLEM]${NC} $*"; PROBLEM_MSGS+=("$*"); ((PROBLEMS++)); }
+error()   { echo -e "${RED}[ERROR]${NC} $*"; PROBLEM_MSGS+=("$*"); ((PROBLEMS++)); }
 warning() { echo -e "${YELLOW}[WARNING]${NC} $*"; WARNING_MSGS+=("$*"); ((WARNINGS++)); }
 info()    { [[ ${SILENT:-0} -eq 1 ]] || echo -e "${CYAN}[INFO]${NC} $*"; }
 info_always() { echo -e "${CYAN}[INFO]${NC} $*"; }
@@ -481,6 +482,40 @@ check_module_containers() {
         [[ "$oom" == true ]] && problem "${mod}: container ${name} was killed due to memory exhaustion (OOM)"
         [[ "$health" == unhealthy ]] && problem "${mod}: container ${name} is unhealthy"
     done <<< "$inspect"
+    return 0
+}
+
+check_interface_ipv6() {
+    local conf_dir="${1:-/proc/sys/net/ipv6/conf}" interface_dir interface disabled
+    local checked=0 unknown=0
+    local -a enabled=()
+
+    # No IPv6 sysctls are exposed when the kernel IPv6 stack is unavailable.
+    if [[ ! -e "$conf_dir" ]]; then
+        ok "IPv6 is unavailable on this node"
+        return 0
+    fi
+    for interface_dir in "$conf_dir"/*; do
+        [[ -d "$interface_dir" ]] || continue
+        interface=${interface_dir##*/}
+        # all/default are settings, not interfaces; all is not an aggregate.
+        [[ "$interface" == all || "$interface" == default ]] && continue
+        if ! IFS= read -r disabled 2>/dev/null < "$interface_dir/disable_ipv6" ||
+            [[ "$disabled" != 0 && "$disabled" != 1 ]]; then
+            warning "Cannot determine IPv6 state for interface ${interface}"
+            unknown=1
+            continue
+        fi
+        checked=$((checked + 1))
+        [[ "$disabled" == 0 ]] && enabled+=("$interface")
+    done
+    if (( ${#enabled[@]} )); then
+        error "IPv6 is enabled on network interface(s): ${enabled[*]}"
+    elif (( checked > 0 && unknown == 0 )); then
+        ok "IPv6 is disabled on all network interfaces"
+    elif (( checked == 0 && unknown == 0 )); then
+        warning "Cannot determine network interface IPv6 state"
+    fi
     return 0
 }
 
@@ -3096,6 +3131,7 @@ section_general_system_data() {
     header "General System Data"
 
     info_always "IP addresses: ${LOCAL_IPS_DISPLAY}"
+    check_interface_ipv6
     if (( OFFLINE )); then
         info_always "Public IP: lookup skipped (--offline)"
     else
