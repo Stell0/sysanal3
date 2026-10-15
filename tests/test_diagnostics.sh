@@ -332,56 +332,93 @@ printf '' > "$fixture_root/empty.ids"
 check_module_containers empty >> "$fixture_root/output"
 assert_eq "$WARNINGS" 2 'modules without containers are allowed'
 
+# Only the configured local SIP interface of installed proxies is relevant.
 ipv6_conf="$fixture_root/ipv6 conf"
-mkdir -p "$ipv6_conf"/{all,default,lo,eth0,eth0.100,veth0}
-for interface in all default lo eth0 eth0.100 veth0; do
-    printf '1\n' > "$ipv6_conf/$interface/disable_ipv6"
+mkdir -p "$ipv6_conf"/{all,default,lo,eth0,eth0.100,veth0,wg0}
+for interface in all default lo eth0 eth0.100 veth0 wg0; do
+    printf '0\n' > "$ipv6_conf/$interface/disable_ipv6"
 done
+cat > "$fixture_root/bin/ip" <<'MOCK'
+#!/bin/bash
+[[ "$*" == '-o addr show' ]] || exit 99
+[[ ! -f "$DIAGNOSTIC_FIXTURES/ip-failure" ]] || exit 1
+cat <<'DATA'
+1: lo    inet 127.0.0.1/8 scope host lo
+2: eth0    inet 192.0.2.2/24 scope global eth0
+3: eth0.100@eth0    inet 10.0.0.2/24 scope global eth0.100
+4: wg0    inet 10.5.4.1/32 scope global wg0
+DATA
+MOCK
+chmod +x "$fixture_root/bin/ip"
 reset_messages
 SILENT=0
-printf '0\n' > "$ipv6_conf/all/disable_ipv6"
-printf '0\n' > "$ipv6_conf/default/disable_ipv6"
+MODULES_ON_NODE='voice|source|1|nethvoice'
 check_interface_ipv6 "$ipv6_conf" > "$fixture_root/ipv6-output"
-assert_eq "$PROBLEMS" 0 'all/default are not interfaces'
-assert_eq "$WARNINGS" 0 'disabled interfaces do not warn'
-assert_contains "$(cat "$fixture_root/ipv6-output")" '[OK]' 'all disabled interfaces report OK'
-printf '1\n' > "$ipv6_conf/all/disable_ipv6"
-printf '1\n' > "$ipv6_conf/default/disable_ipv6"
+assert_eq "$PROBLEMS|$WARNINGS" '0|0' 'IPv6 on a node without a proxy is allowed'
+assert_eq "$(cat "$fixture_root/ipv6-output")" '' 'no interface checks without a proxy'
+MODULES_ON_NODE='proxy|source|1|nethvoice-proxy'
+MODULE_PATH_STATUS[proxy]=0
+MODULE_ENV_FILES[proxy]="$fixture_root/proxy-environment"
+printf 'PUBLIC_IP=192.0.2.2\nSERVICE_IP=10.5.4.1\n' > "$fixture_root/proxy-environment"
+printf '1\n' > "$ipv6_conf/eth0/disable_ipv6"
+check_interface_ipv6 "$ipv6_conf" > "$fixture_root/ipv6-output"
+assert_eq "$PROBLEMS|$WARNINGS" '0|0' 'enabled IPv6 on unrelated interfaces is ignored'
+assert_contains "$(cat "$fixture_root/ipv6-output")" '[OK]' 'disabled proxy interface reports OK'
 printf '0\n' > "$ipv6_conf/eth0/disable_ipv6"
 SILENT=1
 OFFLINE=1
 check_interface_ipv6 "$ipv6_conf" > "$fixture_root/ipv6-output"
-assert_eq "$PROBLEMS" 1 'one enabled interface is a problem even when all/default are disabled'
-assert_contains "$(cat "$fixture_root/ipv6-output")" '[ERROR]' 'IPv6 error is visible in silent/offline mode'
-assert_contains "${PROBLEM_MSGS[0]}" 'eth0' 'enabled interface named'
-assert_contains "$(print_json_report)" 'IPv6 is enabled on network interface(s): eth0' 'IPv6 is included in JSON problems'
+assert_eq "$PROBLEMS|$WARNINGS" '0|1' 'proxy IPv6 only warns even in silent/offline mode'
+assert_contains "$(cat "$fixture_root/ipv6-output")" '[WARNING]' 'warning visible in silent/offline mode'
+assert_contains "${WARNING_MSGS[0]}" 'NethVoice proxy interface eth0' 'proxy interface named'
+json=$(print_json_report)
+assert_contains "$json" '"problem_count":0,"warning_count":1,"problems":[],"warnings":["proxy: IPv6' 'IPv6 appears only in JSON warnings'
 reset_messages
-printf '1\n' > "$ipv6_conf/eth0/disable_ipv6"
-printf '0\n' > "$ipv6_conf/lo/disable_ipv6"
+printf 'PRIVATE_IP=10.0.0.2\nPUBLIC_IP=198.51.100.1\n' > "$fixture_root/proxy-environment"
 check_interface_ipv6 "$ipv6_conf" >> "$fixture_root/ipv6-output"
-assert_eq "$PROBLEMS" 1 'loopback alone with IPv6 enabled is a problem'
+assert_eq "$PROBLEMS|$WARNINGS" '0|1' 'NAT proxy uses PRIVATE_IP rather than external PUBLIC_IP'
+assert_contains "${WARNING_MSGS[0]}" 'interface eth0.100' 'VLAN peer suffix is removed'
 reset_messages
-printf '0\n' > "$ipv6_conf/eth0.100/disable_ipv6"
-printf '0\n' > "$ipv6_conf/veth0/disable_ipv6"
+MODULES_ON_NODE+=$'\nproxy2|source|1|nethvoice-proxy'
+MODULE_PATH_STATUS[proxy2]=0
+MODULE_ENV_FILES[proxy2]="$fixture_root/proxy-environment"
 check_interface_ipv6 "$ipv6_conf" >> "$fixture_root/ipv6-output"
-assert_eq "$PROBLEMS" 1 'multiple enabled interfaces produce one finding'
-assert_contains "${PROBLEM_MSGS[0]}" 'eth0.100 lo veth0' 'VLAN, loopback and virtual interfaces named'
+assert_eq "$WARNINGS" 1 'shared proxy interfaces reported once'
+MODULES_ON_NODE='proxy|source|1|nethvoice-proxy'
 reset_messages
-printf '1\n' > "$ipv6_conf/lo/disable_ipv6"
-printf '1\n' > "$ipv6_conf/veth0/disable_ipv6"
 printf 'invalid\n' > "$ipv6_conf/eth0.100/disable_ipv6"
-rm "$ipv6_conf/eth0/disable_ipv6"
+check_interface_ipv6 "$ipv6_conf" >> "$fixture_root/ipv6-output"
+assert_eq "$PROBLEMS|$WARNINGS" '0|1' 'invalid proxy interface measurement warns'
+reset_messages
+rm "$ipv6_conf/eth0.100/disable_ipv6"
 check_interface_ipv6 "$ipv6_conf" >> "$fixture_root/ipv6-output" 2> "$fixture_root/ipv6-stderr"
-assert_eq "$PROBLEMS" 0 'unavailable IPv6 state is not a false enabled finding'
-assert_eq "$WARNINGS" 2 'missing and invalid interface state warn'
+assert_eq "$PROBLEMS|$WARNINGS" '0|1' 'missing proxy interface measurement warns'
 assert_eq "$(cat "$fixture_root/ipv6-stderr")" '' 'missing interface files do not expose raw errors'
 reset_messages
+printf 'PUBLIC_IP=198.51.100.1\n' > "$fixture_root/proxy-environment"
+check_interface_ipv6 "$ipv6_conf" >> "$fixture_root/ipv6-output"
+assert_eq "$PROBLEMS|$WARNINGS" '0|1' 'nonlocal proxy address warns without scanning other interfaces'
+reset_messages
+printf '' > "$fixture_root/proxy-environment"
+check_interface_ipv6 "$ipv6_conf" >> "$fixture_root/ipv6-output"
+assert_eq "$PROBLEMS|$WARNINGS" '0|1' 'missing proxy address warns'
+reset_messages
+printf 'PUBLIC_IP=192.0.2.2\n' > "$fixture_root/proxy-environment"
+touch "$fixture_root/ip-failure"
+check_interface_ipv6 "$ipv6_conf" >> "$fixture_root/ipv6-output"
+assert_eq "$PROBLEMS|$WARNINGS" '0|1' 'failed interface lookup warns'
+rm "$fixture_root/ip-failure"
+reset_messages
+MODULE_PATH_STATUS[proxy]=1
+check_interface_ipv6 "$ipv6_conf" >> "$fixture_root/ipv6-output"
+assert_eq "$PROBLEMS|$WARNINGS" '0|0' 'previously warned environment failure is skipped'
+MODULE_PATH_STATUS[proxy]=0
+reset_messages
 check_interface_ipv6 "$fixture_root/absent-ipv6" >> "$fixture_root/ipv6-output"
-assert_eq "$PROBLEMS" 0 'kernel without IPv6 has no IPv6 finding'
-assert_eq "$WARNINGS" 0 'absent kernel IPv6 sysctls are allowed'
-mkdir "$fixture_root/empty-ipv6"
-check_interface_ipv6 "$fixture_root/empty-ipv6" >> "$fixture_root/ipv6-output"
-assert_eq "$WARNINGS" 1 'existing sysctl directory without interface measurements warns'
+assert_eq "$PROBLEMS|$WARNINGS" '0|0' 'absent kernel IPv6 sysctls are allowed'
+unset 'MODULE_PATH_STATUS[proxy]' 'MODULE_PATH_STATUS[proxy2]' 'MODULE_ENV_FILES[proxy]' 'MODULE_ENV_FILES[proxy2]'
+MODULES_ON_NODE=''
+rm "$fixture_root/bin/ip"
 OFFLINE=0
 
 memory_fixture() {
